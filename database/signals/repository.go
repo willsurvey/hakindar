@@ -1,0 +1,985 @@
+package signals
+
+import (
+	"fmt"
+	"log"
+	"sort"
+	"time"
+
+	"stockbit-haka-haki/database/analytics"
+	models "stockbit-haka-haki/database/models_pkg"
+	"stockbit-haka-haki/database/trades"
+	"stockbit-haka-haki/database/types"
+
+	"gorm.io/gorm"
+)
+
+// Repository handles database operations for trading signals
+type Repository struct {
+	db        *gorm.DB
+	analytics *analytics.Repository
+	trades    *trades.Repository
+}
+
+// SetAnalyticsRepository sets the analytics repository for strategy evaluation
+func (r *Repository) SetAnalyticsRepository(analyticsRepo *analytics.Repository) {
+	r.analytics = analyticsRepo
+}
+
+// SetTradesRepository sets the trades repository for fallback calculations
+func (r *Repository) SetTradesRepository(tradesRepo *trades.Repository) {
+	r.trades = tradesRepo
+}
+
+// NewRepository creates a new signals repository
+func NewRepository(db *gorm.DB) *Repository {
+	return &Repository{db: db}
+}
+
+// SaveTradingSignal persists a trading signal to the database
+func (r *Repository) SaveTradingSignal(signal *models.TradingSignalDB) error {
+	if err := r.db.Create(signal).Error; err != nil {
+		return fmt.Errorf("SaveTradingSignal: %w", err)
+	}
+	return nil
+}
+
+// GetTradingSignals retrieves trading signals with filters
+func (r *Repository) GetTradingSignals(symbol string, strategy string, decision string, startTime, endTime time.Time, limit, offset int) ([]models.TradingSignalDB, error) {
+	var signals []models.TradingSignalDB
+	query := r.db.Order("generated_at DESC")
+
+	if symbol != "" {
+		query = query.Where("stock_symbol = ?", symbol)
+	}
+	if strategy != "" {
+		query = query.Where("strategy = ?", strategy)
+	}
+	if decision != "" {
+		query = query.Where("decision = ?", decision)
+	}
+	if !startTime.IsZero() {
+		query = query.Where("generated_at >= ?", startTime)
+	}
+	if !endTime.IsZero() {
+		query = query.Where("generated_at <= ?", endTime)
+	}
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	if offset > 0 {
+		query = query.Offset(offset)
+	}
+
+	if err := query.Find(&signals).Error; err != nil {
+		return nil, fmt.Errorf("GetTradingSignals: %w", err)
+	}
+	return signals, nil
+}
+
+// GetSignalByID retrieves a specific signal by ID
+func (r *Repository) GetSignalByID(id int64) (*models.TradingSignalDB, error) {
+	var signal models.TradingSignalDB
+	err := r.db.First(&signal, id).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("GetSignalByID: %w", err)
+	}
+	return &signal, nil
+}
+
+// OPTIMIZATION: GetSignalsByIDs retrieves multiple signals by IDs in a single query
+// Eliminates N+1 query problem when fetching signals for multiple outcomes
+func (r *Repository) GetSignalsByIDs(ids []int64) (map[int64]*models.TradingSignalDB, error) {
+	if len(ids) == 0 {
+		return make(map[int64]*models.TradingSignalDB), nil
+	}
+
+	var signals []models.TradingSignalDB
+	err := r.db.Where("id IN ?", ids).Find(&signals).Error
+	if err != nil {
+		return nil, fmt.Errorf("GetSignalsByIDs: %w", err)
+	}
+
+	result := make(map[int64]*models.TradingSignalDB, len(signals))
+	for i := range signals {
+		result[signals[i].ID] = &signals[i]
+	}
+	return result, nil
+}
+
+// SaveSignalOutcome creates a new signal outcome record
+func (r *Repository) SaveSignalOutcome(outcome *models.SignalOutcome) error {
+	if err := r.db.Create(outcome).Error; err != nil {
+		return fmt.Errorf("SaveSignalOutcome: %w", err)
+	}
+	return nil
+}
+
+// UpdateSignalOutcome updates an existing signal outcome
+func (r *Repository) UpdateSignalOutcome(outcome *models.SignalOutcome) error {
+	if err := r.db.Save(outcome).Error; err != nil {
+		return fmt.Errorf("UpdateSignalOutcome: %w", err)
+	}
+	return nil
+}
+
+// GetSignalOutcomes retrieves signal outcomes with filters
+func (r *Repository) GetSignalOutcomes(symbol string, status string, startTime, endTime time.Time, limit, offset int) ([]models.SignalOutcome, error) {
+	var outcomes []models.SignalOutcome
+	query := r.db.Order("entry_time DESC")
+
+	if symbol != "" {
+		query = query.Where("stock_symbol = ?", symbol)
+	}
+	if status != "" {
+		query = query.Where("outcome_status = ?", status)
+	}
+	if !startTime.IsZero() {
+		query = query.Where("entry_time >= ?", startTime)
+	}
+	if !endTime.IsZero() {
+		query = query.Where("entry_time <= ?", endTime)
+	}
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	if offset > 0 {
+		query = query.Offset(offset)
+	}
+
+	if err := query.Find(&outcomes).Error; err != nil {
+		return nil, fmt.Errorf("GetSignalOutcomes: %w", err)
+	}
+	return outcomes, nil
+}
+
+// GetSignalOutcomeBySignalID retrieves outcome for a specific signal
+func (r *Repository) GetSignalOutcomeBySignalID(signalID int64) (*models.SignalOutcome, error) {
+	var outcome models.SignalOutcome
+	err := r.db.Where("signal_id = ?", signalID).First(&outcome).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("GetSignalOutcomeBySignalID: %w", err)
+	}
+	return &outcome, nil
+}
+
+// GetOpenSignals retrieves signals that don't have outcomes yet
+// Only retrieves recent BUY signals to avoid processing stale or non-actionable signals over and over
+func (r *Repository) GetOpenSignals(limit int) ([]models.TradingSignalDB, error) {
+	var signals []models.TradingSignalDB
+
+	// Subquery to find signal IDs that already have outcomes
+	subQuery := r.db.Model(&models.SignalOutcome{}).Select("signal_id")
+
+	// Get recent BUY signals NOT IN the subquery
+	query := r.db.Where("id NOT IN (?)", subQuery).
+		Where("decision = ?", "BUY").
+		Where("generated_at >= ?", time.Now().Add(-15*time.Minute)).
+		Order("generated_at DESC")
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	if err := query.Find(&signals).Error; err != nil {
+		return nil, fmt.Errorf("GetOpenSignals: %w", err)
+	}
+	return signals, nil
+}
+
+// GetSignalPerformanceStats calculates performance statistics
+func (r *Repository) GetSignalPerformanceStats(strategy string, symbol string) (*types.PerformanceStats, error) {
+	// Check if there are any outcomes first
+	query := r.db.Model(&models.SignalOutcome{}).
+		Joins("JOIN trading_signals ON signal_outcomes.signal_id = trading_signals.id").
+		Where("signal_outcomes.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN', 'OPEN')")
+
+	if strategy != "" && strategy != "ALL" {
+		query = query.Where("trading_signals.strategy = ?", strategy)
+	}
+	if symbol != "" {
+		query = query.Where("signal_outcomes.stock_symbol = ?", symbol)
+	}
+
+	var count int64
+	if err := query.Count(&count).Error; err != nil {
+		return nil, fmt.Errorf("GetSignalPerformanceStats count: %w", err)
+	}
+
+	// Return nil if no data exists
+	if count == 0 {
+		return nil, nil
+	}
+
+	var stats types.PerformanceStats
+
+	sqlQuery := `
+		SELECT
+			ts.strategy,
+			ts.stock_symbol,
+			COUNT(*) AS total_signals,
+			SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END) AS wins,
+			SUM(CASE WHEN so.outcome_status = 'LOSS' THEN 1 ELSE 0 END) AS losses,
+			SUM(CASE WHEN so.outcome_status = 'OPEN' THEN 1 ELSE 0 END) AS open_positions,
+			ROUND(
+				(SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL /
+					NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0)) * 100,
+				2
+			) AS win_rate,
+			COALESCE(AVG(so.profit_loss_pct), 0) AS avg_profit_pct,
+			COALESCE(SUM(so.profit_loss_pct), 0) AS total_profit_pct,
+			COALESCE(MAX(so.profit_loss_pct), 0) AS max_win_pct,
+			COALESCE(MIN(so.profit_loss_pct), 0) AS max_loss_pct,
+			COALESCE(AVG(so.risk_reward_ratio), 0) AS avg_risk_reward,
+			(COALESCE(AVG(so.profit_loss_pct), 0) *
+			 (SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL / NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0))
+			) AS expectancy
+		FROM trading_signals ts
+		JOIN signal_outcomes so ON ts.id = so.signal_id AND date_trunc('day', ts.generated_at) = date_trunc('day', so.entry_time)
+		WHERE so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN', 'OPEN')
+	`
+
+	var args []interface{}
+	if strategy != "" && strategy != "ALL" {
+		sqlQuery += " AND ts.strategy = ?"
+		args = append(args, strategy)
+	}
+	if symbol != "" {
+		sqlQuery += " AND ts.stock_symbol = ?"
+		args = append(args, symbol)
+	}
+
+	sqlQuery += " GROUP BY ts.strategy, ts.stock_symbol"
+
+	if err := r.db.Raw(sqlQuery, args...).Scan(&stats).Error; err != nil {
+		return nil, fmt.Errorf("GetSignalPerformanceStats: %w", err)
+	}
+
+	return &stats, nil
+}
+
+// GetGlobalPerformanceStats calculates global performance statistics across all strategies and symbols
+func (r *Repository) GetGlobalPerformanceStats() (*types.PerformanceStats, error) {
+	// Check if there are any outcomes first
+	var count int64
+	if err := r.db.Model(&models.SignalOutcome{}).
+		Where("outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN', 'OPEN')").
+		Count(&count).Error; err != nil {
+		return nil, fmt.Errorf("GetGlobalPerformanceStats count: %w", err)
+	}
+
+	// Return nil if no data exists
+	if count == 0 {
+		return nil, nil
+	}
+
+	var stats types.PerformanceStats
+
+	query := `
+		SELECT
+			'GLOBAL' AS strategy,
+			'ALL' AS stock_symbol,
+			COUNT(*) AS total_signals,
+			SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END) AS wins,
+			SUM(CASE WHEN so.outcome_status = 'LOSS' THEN 1 ELSE 0 END) AS losses,
+			SUM(CASE WHEN so.outcome_status = 'OPEN' THEN 1 ELSE 0 END) AS open_positions,
+			ROUND(
+				(SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL /
+					NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0)) * 100,
+				2
+			) AS win_rate,
+			COALESCE(AVG(so.profit_loss_pct), 0) AS avg_profit_pct,
+			COALESCE(SUM(so.profit_loss_pct), 0) AS total_profit_pct,
+			COALESCE(MAX(so.profit_loss_pct), 0) AS max_win_pct,
+			COALESCE(MIN(so.profit_loss_pct), 0) AS max_loss_pct,
+			COALESCE(AVG(so.risk_reward_ratio), 0) AS avg_risk_reward,
+			(COALESCE(AVG(so.profit_loss_pct), 0) *
+			 (SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL / NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0))
+			) AS expectancy
+		FROM trading_signals ts
+		JOIN signal_outcomes so ON ts.id = so.signal_id AND date_trunc('day', ts.generated_at) = date_trunc('day', so.entry_time)
+		WHERE so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN', 'OPEN')
+	`
+
+	if err := r.db.Raw(query).Scan(&stats).Error; err != nil {
+		return nil, fmt.Errorf("GetGlobalPerformanceStats: %w", err)
+	}
+
+	return &stats, nil
+}
+
+// GetDailyStrategyPerformance retrieves daily aggregated performance data
+func (r *Repository) GetDailyStrategyPerformance(strategy, symbol string, limit int) ([]map[string]interface{}, error) {
+	// Refresh materialized view to ensure latest data
+	if err := r.db.Exec(`REFRESH MATERIALIZED VIEW strategy_performance_daily`).Error; err != nil {
+		// Log but don't fail - use existing data
+		fmt.Printf("⚠️ Failed to refresh performance view: %v\n", err)
+	}
+
+	var results []map[string]interface{}
+	query := r.db.Table("strategy_performance_daily").Order("day DESC")
+
+	if strategy != "" && strategy != "ALL" {
+		query = query.Where("strategy = ?", strategy)
+	}
+	if symbol != "" {
+		query = query.Where("stock_symbol = ?", symbol)
+	}
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	if err := query.Find(&results).Error; err != nil {
+		return nil, fmt.Errorf("GetDailyStrategyPerformance: %w", err)
+	}
+	return results, nil
+}
+
+// EvaluateVolumeBreakoutStrategy implements Volume Breakout Validation strategy
+// Logic: Price increase (>2.5%) + explosive volume (z-score > 3.0) + Price > VWAP + Net Buy > 0 = BUY signal
+func (r *Repository) EvaluateVolumeBreakoutStrategy(alert *models.WhaleAlert, zscores *types.ZScoreData, vwap float64, orderFlow *models.OrderFlowImbalance) *models.TradingSignal {
+	signal := &models.TradingSignal{
+		StockSymbol:  alert.StockSymbol,
+		Timestamp:    alert.DetectedAt,
+		Strategy:     "VOLUME_BREAKOUT",
+		PriceZScore:  zscores.PriceZScore,
+		VolumeZScore: zscores.VolumeZScore,
+		Price:        alert.TriggerPrice,
+		Volume:       alert.TriggerVolumeLots,
+		Change:       zscores.PriceChange,
+	}
+
+	// STRONG SIGNAL CRITERIA:
+	// 1. Trend Confirmation: Price MUST be above VWAP
+	// 2. Volume Strength: Z-Score > 3.0 (was 2.5)
+	// 3. Price Momentum: Change > 2.5% (was 2.0%)
+	// 4. Order Flow: Net Buy Volume must be positive (Buying > Selling)
+
+	isBullishTrend := vwap > 0 && alert.TriggerPrice > vwap
+
+	// Order Flow Confirmation - STRICT
+	isAggressiveBuying := false
+	if orderFlow != nil && orderFlow.AggressiveBuyPct != nil {
+		isAggressiveBuying = *orderFlow.AggressiveBuyPct > 50.0
+	}
+
+	// ENHANCED: Stricter thresholds for higher quality signals
+	if zscores.PriceZScore > 2.5 && zscores.VolumeZScore > 3.0 {
+		if isBullishTrend && isAggressiveBuying {
+			signal.Decision = "BUY"
+			// Calculate confidence based on both price and volume Z-scores
+			volConfidence := calculateConfidence(zscores.VolumeZScore, 3.0, 6.0)
+			priceConfidence := calculateConfidence(zscores.PriceZScore, 2.5, 5.0)
+			signal.Confidence = (volConfidence*0.6 + priceConfidence*0.4) // Weight volume higher
+
+			// Boost confidence if aggressive buying is high
+			if orderFlow != nil && orderFlow.AggressiveBuyPct != nil && *orderFlow.AggressiveBuyPct > 60.0 {
+				signal.Confidence = min(signal.Confidence*1.15, 1.0)
+			}
+
+			signal.Reason = r.generateAIReasoning(signal, "Strong breakout confirmed: Volume Z > 3.0, Price Z > 2.5, above VWAP, strong order flow", vwap)
+		} else if isBullishTrend {
+			// Good trend but Order Flow weak -> WAIT (don't chase)
+			signal.Decision = "WAIT"
+			signal.Confidence = calculateConfidence(zscores.VolumeZScore, 3.0, 6.0) * 0.5
+			signal.Reason = r.generateAIReasoning(signal, "Breakout pattern but weak order flow confirmation", vwap)
+		} else {
+			// Below VWAP -> NO TRADE (counter-trend)
+			signal.Decision = "NO_TRADE"
+			signal.Confidence = 0.15
+			signal.Reason = "Breakout below VWAP - counter-trend signal rejected"
+		}
+	} else if zscores.PriceZScore > 2.0 && zscores.VolumeZScore > 2.5 {
+		// Moderate breakout - wait for confirmation
+		signal.Decision = "WAIT"
+		signal.Confidence = calculateConfidence(zscores.VolumeZScore, 2.5, 4.0) * 0.6
+		signal.Reason = r.generateAIReasoning(signal, "Moderate breakout - awaiting stronger confirmation", vwap)
+	} else {
+		signal.Decision = "NO_TRADE"
+		signal.Confidence = 0.1
+		signal.Reason = "No significant statistical breakout detected"
+	}
+
+	return signal
+}
+
+// EvaluateMeanReversionStrategy implements Mean Reversion (Contrarian) strategy
+// Logic: Extreme price (z-score > 3.5) + declining volume = SELL signal (overbought)
+// ENHANCEMENT: Uses VWAP deviation and Order Flow Aggressive Buy for entry confidence
+func (r *Repository) EvaluateMeanReversionStrategy(alert *models.WhaleAlert, zscores *types.ZScoreData, prevVolumeZScore float64, vwap float64, orderFlow *models.OrderFlowImbalance) *models.TradingSignal {
+	signal := &models.TradingSignal{
+		StockSymbol:  alert.StockSymbol,
+		Timestamp:    alert.DetectedAt,
+		Strategy:     "MEAN_REVERSION",
+		PriceZScore:  zscores.PriceZScore,
+		VolumeZScore: zscores.VolumeZScore,
+		Price:        alert.TriggerPrice,
+		Volume:       alert.TriggerVolumeLots,
+		Change:       zscores.PriceChange,
+	}
+
+	// Detect volume divergence - now requires stronger signal
+	volumeDeclining := zscores.VolumeZScore < prevVolumeZScore && zscores.VolumeZScore < 1.0
+
+	// Check conditions: price_z_score > 3.5 (increased from 3.0) AND volume declining
+	if zscores.PriceZScore > 3.5 && volumeDeclining {
+		signal.Decision = "SELL"
+		// Confidence based on price extreme and volume confirmation
+		priceConf := calculateConfidence(zscores.PriceZScore, 3.5, 6.0)
+		volConf := calculateConfidence(prevVolumeZScore-zscores.VolumeZScore, 0.5, 2.0)
+		signal.Confidence = priceConf*0.7 + volConf*0.3
+		signal.Reason = r.generateAIReasoning(signal, "Strong overextension (Price Z > 3.5) with volume divergence", vwap)
+	} else if zscores.PriceZScore > 3.5 {
+		signal.Decision = "WAIT"
+		signal.Confidence = calculateConfidence(zscores.PriceZScore, 3.5, 6.0) * 0.6
+		signal.Reason = r.generateAIReasoning(signal, "Overbought but volume not confirming divergence", vwap)
+	} else if zscores.PriceZScore < -3.5 { // Increased from -3.0
+		// ENHANCED: Mean reversion BUY signal - much stricter
+		// Must be deep value AND smart money buying
+		isDeepValue := alert.TriggerPrice < (vwap * 0.93) // 7% below VWAP (increased from 5%)
+
+		// Strong smart money presence required
+		isSmartMoneyBuying := false
+		strongBuying := false
+		if orderFlow != nil && orderFlow.AggressiveBuyPct != nil {
+			if *orderFlow.AggressiveBuyPct > 45.0 {
+				isSmartMoneyBuying = true
+				strongBuying = *orderFlow.AggressiveBuyPct > 55.0
+			}
+		}
+
+		// Must have both deep value AND smart money
+		if isDeepValue && isSmartMoneyBuying {
+			signal.Decision = "BUY"
+			baseConfidence := calculateConfidence(-zscores.PriceZScore, 3.5, 6.0)
+			if strongBuying {
+				signal.Confidence = min(baseConfidence*1.2, 1.0)
+				signal.Reason = r.generateAIReasoning(signal, "Deep oversold (7%+ below VWAP) with strong smart money (>55%)", vwap)
+			} else {
+				signal.Confidence = baseConfidence * 0.9
+				signal.Reason = r.generateAIReasoning(signal, "Deep oversold with moderate smart money support", vwap)
+			}
+		} else if isDeepValue {
+			// Deep value but no smart money - wait
+			signal.Decision = "WAIT"
+			signal.Confidence = calculateConfidence(-zscores.PriceZScore, 3.5, 6.0) * 0.5
+			signal.Reason = r.generateAIReasoning(signal, "Deeply oversold but awaiting smart money confirmation", vwap)
+		} else {
+			signal.Decision = "WAIT"
+			signal.Confidence = 0.25
+			signal.Reason = r.generateAIReasoning(signal, "Moderately oversold - insufficient margin of safety", vwap)
+		}
+	} else {
+		signal.Decision = "NO_TRADE"
+		signal.Confidence = 0.1
+		signal.Reason = "Price within normal range"
+	}
+
+	return signal
+}
+
+// EvaluateFakeoutFilterStrategy implements Fakeout Filter (Defense) strategy
+// Logic: Price breakout + low volume (z-score < 1) = NO_TRADE (likely bull trap)
+func (r *Repository) EvaluateFakeoutFilterStrategy(alert *models.WhaleAlert, zscores *types.ZScoreData, vwap float64) *models.TradingSignal {
+	signal := &models.TradingSignal{
+		StockSymbol:  alert.StockSymbol,
+		Timestamp:    alert.DetectedAt,
+		Strategy:     "FAKEOUT_FILTER",
+		PriceZScore:  zscores.PriceZScore,
+		VolumeZScore: zscores.VolumeZScore,
+		Price:        alert.TriggerPrice,
+		Volume:       alert.TriggerVolumeLots,
+		Change:       zscores.PriceChange,
+	}
+
+	// Detect potential breakout (price moving significantly)
+	// Detect potential breakout (price moving significantly)
+	isBreakout := zscores.PriceZScore > 2.0
+
+	// Check volume strength
+	if isBreakout && zscores.VolumeZScore < 1.0 {
+		signal.Decision = "NO_TRADE"
+		signal.Confidence = 0.8 // High confidence to AVOID
+		signal.Reason = r.generateAIReasoning(signal, "FAKEOUT DETECTED: Price jump without volume support", vwap)
+	} else if isBreakout && zscores.VolumeZScore >= 2.0 {
+		signal.Decision = "BUY"
+		signal.Confidence = calculateConfidence(zscores.VolumeZScore, 2.0, 5.0)
+		signal.Reason = r.generateAIReasoning(signal, "Valid breakout with confirmed volume", vwap)
+	} else if isBreakout {
+		signal.Decision = "WAIT"
+		signal.Confidence = 0.4
+		signal.Reason = r.generateAIReasoning(signal, "Breakout volume is moderate, awaiting confirmation", vwap)
+	} else {
+		signal.Decision = "NO_TRADE"
+		signal.Confidence = 0.1
+		signal.Reason = "No breakout pattern detected"
+	}
+
+	return signal
+}
+
+// generateAIReasoning constructs a sophisticated, natural-language explanation mimicking LLM output
+func (r *Repository) generateAIReasoning(signal *models.TradingSignal, coreReason string, vwap float64) string {
+	reason := fmt.Sprintf("🤖 **AI Analysis:** %s.", coreReason)
+
+	// Add statistical context
+	if signal.Decision == "BUY" {
+		reason += fmt.Sprintf(" Bullish anomaly detected (Z-Score: %.2f).", signal.VolumeZScore)
+		if vwap > 0 && signal.Price > vwap {
+			reason += " Price > VWAP confirmation."
+		}
+	} else if signal.Decision == "SELL" {
+		reason += fmt.Sprintf(" Bearish divergence identified (Price Z: %.2f).", signal.PriceZScore)
+	}
+
+	// Add confidence context
+	if signal.Confidence > 0.8 {
+		reason += " **High Conviction Setups.**"
+	}
+
+	return reason
+}
+
+// GetStrategySignals evaluates recent whale alerts and generates trading signals
+func (r *Repository) GetStrategySignals(lookbackMinutes int, minConfidence float64, strategyFilter string, alerts []models.WhaleAlert) ([]models.TradingSignal, error) {
+	var signals []models.TradingSignal
+
+	// Track previous volume z-scores for divergence detection
+	prevVolumeZScores := make(map[string]float64)
+
+	// Fetch recent patterns for potential confirmation (global fetch or per symbol)
+	// For efficiency we could pre-fetch, but for now strict per-symbol checking is safer
+
+	for _, alert := range alerts {
+		// Fetch baseline for this specific symbol
+		baseline, err := r.analytics.GetLatestBaseline(alert.StockSymbol)
+
+		// Initialize zscores container
+		var zscores *types.ZScoreData
+
+		// STRATEGY 1: Use persistent baseline (Most Accurate)
+		if err == nil && baseline != nil && baseline.SampleSize > 10 {
+			// Calculate Z-Score using persistent baseline
+			// Prevent division by zero
+			if baseline.StdDevPrice > 0.0001 && baseline.StdDevVolume > 0.0001 {
+				priceZ := (alert.TriggerPrice - baseline.MeanPrice) / baseline.StdDevPrice
+				volZ := (alert.TriggerVolumeLots - baseline.MeanVolumeLots) / baseline.StdDevVolume
+
+				// Clamp z-scores
+				if priceZ > 100 {
+					priceZ = 100
+				} else if priceZ < -100 {
+					priceZ = -100
+				}
+				if volZ > 100 {
+					volZ = 100
+				} else if volZ < -100 {
+					volZ = -100
+				}
+
+				// Calculate % change
+				var priceChangePct float64
+				if baseline.MeanPrice > 0 {
+					priceChangePct = (alert.TriggerPrice - baseline.MeanPrice) / baseline.MeanPrice * 100
+				}
+
+				zscores = &types.ZScoreData{
+					PriceZScore:  priceZ,
+					VolumeZScore: volZ,
+					SampleCount:  int64(baseline.SampleSize),
+					PriceChange:  priceChangePct,
+					MeanPrice:    baseline.MeanPrice,
+					MeanVolume:   baseline.MeanVolumeLots,
+				}
+			}
+		}
+
+		// STRATEGY 2: Fallback to real-time calculation if baseline missing (Robustness)
+		if zscores == nil && r.trades != nil {
+			// Calculate on-the-fly using last 60 minutes
+			rtStats, err := r.trades.GetPriceVolumeZScores(alert.StockSymbol, alert.TriggerPrice, alert.TriggerVolumeLots, 60)
+			if err == nil && rtStats.SampleCount >= 5 { // Minimum 5 data points
+				zscores = rtStats
+				// Apply a small penalty to confidence since this is less robust
+				log.Printf("⚠️ Using fallback stats for %s (Samples: %d, VolZ: %.2f)", alert.StockSymbol, rtStats.SampleCount, rtStats.VolumeZScore)
+			}
+		}
+
+		// If still no valid z-scores, we must skip
+		if zscores == nil {
+			// Only log occasionally to avoid spam
+			// log.Printf("⚠️ No baseline or fallback data for %s, skipping", alert.StockSymbol)
+			continue
+		}
+
+		// Get detected patterns for this symbol
+		patterns, _ := r.analytics.GetRecentPatterns(alert.StockSymbol, time.Now().Add(-2*time.Hour))
+
+		// Calculate VWAP from baseline (Approximate Session VWAP using Mean Value / Mean Volume)
+		var vwap float64
+		if zscores.MeanVolume > 0 {
+			// Estimate VWAP from MeanPrice - this is an approximation but useful for trend
+			vwap = zscores.MeanPrice
+		}
+
+		// Fetch Latest Order Flow for Confirmation
+		orderFlow, _ := r.analytics.GetLatestOrderFlow(alert.StockSymbol)
+
+		// Evaluate each strategy
+		strategies := []string{"VOLUME_BREAKOUT", "MEAN_REVERSION", "FAKEOUT_FILTER"}
+		if strategyFilter != "" && strategyFilter != "ALL" {
+			strategies = []string{strategyFilter}
+		}
+
+		for _, strategy := range strategies {
+			var signal *models.TradingSignal
+
+			switch strategy {
+			case "VOLUME_BREAKOUT":
+				signal = r.EvaluateVolumeBreakoutStrategy(&alert, zscores, vwap, orderFlow)
+			case "MEAN_REVERSION":
+				prevZScore := prevVolumeZScores[alert.StockSymbol]
+				signal = r.EvaluateMeanReversionStrategy(&alert, zscores, prevZScore, vwap, orderFlow)
+			case "FAKEOUT_FILTER":
+				signal = r.EvaluateFakeoutFilterStrategy(&alert, zscores, vwap)
+			}
+
+			// Pattern Confirmation
+			if signal != nil && len(patterns) > 0 {
+				for _, p := range patterns {
+					if p.StockSymbol == alert.StockSymbol && p.PatternType == "RANGE_BREAKOUT" && p.PatternDirection != nil {
+						if *p.PatternDirection == signal.Decision {
+							signal.Confidence *= 1.3 // Strong confirmation
+							signal.Reason += fmt.Sprintf(" (Confirmed by %s)", p.PatternType)
+							break
+						}
+					}
+				}
+			}
+
+			// Only include signals meeting confidence threshold
+			if signal != nil && signal.Confidence >= minConfidence && signal.Decision != "NO_TRADE" {
+				signals = append(signals, *signal)
+			}
+		}
+
+		// Update previous volume z-score
+		prevVolumeZScores[alert.StockSymbol] = zscores.VolumeZScore
+	}
+
+	// Sort signals by timestamp DESC (newest first), then by strategy name for consistency
+	sort.Slice(signals, func(i, j int) bool {
+		// First, sort by timestamp (newest first)
+		if !signals[i].Timestamp.Equal(signals[j].Timestamp) {
+			return signals[i].Timestamp.After(signals[j].Timestamp)
+		}
+		// If timestamps are equal, sort by strategy name alphabetically
+		return signals[i].Strategy < signals[j].Strategy
+	})
+
+	return signals, nil
+}
+
+// getWhaleAlertsForStrategy fetches whale alerts for strategy evaluation
+func (r *Repository) getWhaleAlertsForStrategy(startTime time.Time) ([]models.WhaleAlert, error) {
+	var alerts []models.WhaleAlert
+
+	query := r.db.Where("detected_at >= ?", startTime).
+		Order("detected_at DESC")
+
+	if err := query.Find(&alerts).Error; err != nil {
+		return nil, fmt.Errorf("getWhaleAlertsForStrategy: %w", err)
+	}
+
+	return alerts, nil
+}
+
+// getDetectedPatternsForStrategy fetches detected patterns for strategy confirmation
+func (r *Repository) getDetectedPatternsForStrategy(startTime time.Time) ([]models.DetectedPattern, error) {
+	var patterns []models.DetectedPattern
+
+	query := r.db.Where("detected_at >= ?", startTime).
+		Where("pattern_type = ?", "RANGE_BREAKOUT"). // Only get range breakout patterns for now
+		Order("detected_at DESC")
+
+	if err := query.Find(&patterns).Error; err != nil {
+		return nil, fmt.Errorf("getDetectedPatternsForStrategy: %w", err)
+	}
+
+	return patterns, nil
+}
+
+// calculateConfidence converts z-score range to confidence percentage
+// Uses sigmoid-like curve for more realistic confidence distribution
+func calculateConfidence(value, minThreshold, maxThreshold float64) float64 {
+	if value < minThreshold {
+		return 0.0
+	}
+	if value >= maxThreshold {
+		return 1.0
+	}
+
+	// Prevent division by zero
+	denominator := maxThreshold - minThreshold
+	if denominator <= 0 {
+		return 0.5
+	}
+
+	// Linear interpolation between min and max
+	ratio := (value - minThreshold) / denominator
+
+	// Apply sigmoid-like transformation for better confidence distribution
+	// This gives higher confidence more gradually rather than linearly
+	confidence := ratio * (2 - ratio) // Quadratic ease-out
+
+	// Additional boost for values near max threshold
+	if ratio > 0.8 {
+		confidence = 0.8 + (ratio-0.8)*1.5 // Accelerate near top
+	}
+
+	// Clamp to [0.3, 1.0] range
+	// Minimum 0.3 to avoid extremely low confidence passing filters
+	if confidence < 0.3 {
+		confidence = 0.3
+	}
+	if confidence > 1.0 {
+		confidence = 1.0
+	}
+
+	return confidence
+}
+
+// GetRecentSignalsWithOutcomes retrieves recent persisted signals with their outcomes
+func (r *Repository) GetRecentSignalsWithOutcomes(lookbackMinutes int, minConfidence float64, strategyFilter string) ([]models.TradingSignal, error) {
+	var results []struct {
+		models.TradingSignalDB
+		Outcome       *string  `gorm:"column:outcome_status"`
+		ProfitLossPct *float64 `gorm:"column:profit_loss_pct"`
+	}
+
+	query := r.db.Table("trading_signals").
+		Select("trading_signals.*, signal_outcomes.outcome_status, signal_outcomes.profit_loss_pct").
+		Joins("LEFT JOIN signal_outcomes ON trading_signals.id = signal_outcomes.signal_id").
+		Where("trading_signals.generated_at >= NOW() - INTERVAL '1 minute' * ?", lookbackMinutes).
+		Where("trading_signals.confidence >= ?", minConfidence).
+		Order("trading_signals.generated_at DESC")
+
+	if strategyFilter != "" && strategyFilter != "ALL" {
+		query = query.Where("trading_signals.strategy = ?", strategyFilter)
+	}
+
+	if err := query.Scan(&results).Error; err != nil {
+		return nil, fmt.Errorf("GetRecentSignalsWithOutcomes: %w", err)
+	}
+
+	signals := make([]models.TradingSignal, len(results))
+	for i, r := range results {
+		// FIX: Default to "PENDING" instead of empty string
+		outcome := "PENDING"
+		if r.Outcome != nil && *r.Outcome != "" {
+			outcome = *r.Outcome
+		}
+
+		pnl := 0.0
+		if r.ProfitLossPct != nil {
+			pnl = *r.ProfitLossPct
+		}
+
+		signals[i] = models.TradingSignal{
+			StockSymbol:   r.StockSymbol,
+			Timestamp:     r.GeneratedAt,
+			Strategy:      r.Strategy,
+			Decision:      r.Decision,
+			PriceZScore:   r.PriceZScore,
+			VolumeZScore:  r.VolumeZScore,
+			Price:         r.TriggerPrice,
+			Volume:        r.TriggerVolumeLots,
+			Change:        r.PriceChangePct,
+			Confidence:    r.Confidence,
+			Reason:        r.Reason,
+			Outcome:       outcome,
+			OutcomeStatus: outcome,
+			ProfitLossPct: pnl,
+		}
+	}
+	return signals, nil
+}
+
+// ============================================================================
+// Signal Effectiveness Analysis Functions
+// ============================================================================
+
+// GetStrategyEffectiveness returns strategy effectiveness analysis
+func (r *Repository) GetStrategyEffectiveness(daysBack int) ([]types.StrategyEffectiveness, error) {
+	var results []types.StrategyEffectiveness
+
+	query := `
+		SELECT
+			ts.strategy,
+			'ALL' as market_regime,
+			COUNT(*) as total_signals,
+			SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END) as wins,
+			SUM(CASE WHEN so.outcome_status = 'LOSS' THEN 1 ELSE 0 END) as losses,
+			ROUND(
+				(SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL /
+					NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0)) * 100,
+				2
+			) as win_rate,
+			COALESCE(AVG(CASE WHEN so.outcome_status = 'WIN' THEN so.profit_loss_pct END), 0) as avg_profit_pct,
+			COALESCE(AVG(CASE WHEN so.outcome_status = 'LOSS' THEN so.profit_loss_pct END), 0) as avg_loss_pct,
+			ROUND(
+				(SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL /
+					NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0)) *
+				COALESCE(AVG(CASE WHEN so.outcome_status = 'WIN' THEN so.profit_loss_pct END), 0) -
+				(1 - SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL /
+					NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0)) *
+				ABS(COALESCE(AVG(CASE WHEN so.outcome_status = 'LOSS' THEN so.profit_loss_pct END), 0)),
+				4
+			) as expected_value
+		FROM trading_signals ts
+		JOIN signal_outcomes so ON ts.id = so.signal_id
+		WHERE so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN')
+		  AND ts.generated_at >= NOW() - INTERVAL '1 day' * ?
+		GROUP BY ts.strategy
+		HAVING COUNT(*) >= 5
+		ORDER BY expected_value DESC
+	`
+
+	if err := r.db.Raw(query, daysBack).Scan(&results).Error; err != nil {
+		return nil, fmt.Errorf("GetStrategyEffectiveness: %w", err)
+	}
+
+	return results, nil
+}
+
+// GetOptimalConfidenceThresholds calculates optimal confidence thresholds per strategy
+// Returns the minimum confidence level where historical win rate exceeds 50%
+func (r *Repository) GetOptimalConfidenceThresholds(daysBack int) ([]types.OptimalThreshold, error) {
+	var results []types.OptimalThreshold
+
+	query := `
+		WITH confidence_buckets AS (
+			SELECT
+				ts.strategy,
+				FLOOR(ts.confidence * 10) / 10 as confidence_bucket,
+				COUNT(*) as total,
+				SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END) as wins
+			FROM trading_signals ts
+			JOIN signal_outcomes so ON ts.id = so.signal_id
+			WHERE so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN')
+			  AND ts.generated_at >= NOW() - INTERVAL '1 day' * ?
+			GROUP BY ts.strategy, FLOOR(ts.confidence * 10) / 10
+		),
+		optimal_confidence AS (
+			SELECT
+				strategy,
+				MIN(confidence_bucket) FILTER (WHERE wins::DECIMAL / NULLIF(total, 0) >= 0.5) as optimal_confidence,
+				AVG(wins::DECIMAL / NULLIF(total, 0)) * 100 as avg_win_rate,
+				SUM(total) as sample_size
+			FROM confidence_buckets
+			GROUP BY strategy
+		)
+		SELECT
+			strategy,
+			COALESCE(optimal_confidence, 0.6) as optimal_confidence,
+			COALESCE(avg_win_rate, 0) as win_rate_at_threshold,
+			COALESCE(sample_size, 0) as sample_size,
+			CASE
+				WHEN optimal_confidence IS NULL THEN 0.7
+				ELSE GREATEST(optimal_confidence - 0.05, 0.5)
+			END as recommended_min_conf
+		FROM optimal_confidence
+		ORDER BY optimal_confidence ASC
+	`
+
+	if err := r.db.Raw(query, daysBack).Scan(&results).Error; err != nil {
+		return nil, fmt.Errorf("GetOptimalConfidenceThresholds: %w", err)
+	}
+
+	return results, nil
+}
+
+// GetTimeOfDayEffectiveness returns signal effectiveness grouped by hour
+// Identifies optimal trading windows for each strategy
+func (r *Repository) GetTimeOfDayEffectiveness(daysBack int) ([]types.TimeEffectiveness, error) {
+	var results []types.TimeEffectiveness
+
+	query := `
+		SELECT
+			EXTRACT(HOUR FROM ts.generated_at AT TIME ZONE 'Asia/Jakarta')::INT as hour,
+			ts.strategy,
+			COUNT(*) as total_signals,
+			ROUND(
+				(SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL /
+					NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0)) * 100,
+				2
+			) as win_rate,
+			COALESCE(AVG(so.profit_loss_pct), 0) as avg_profit_pct
+		FROM trading_signals ts
+		JOIN signal_outcomes so ON ts.id = so.signal_id
+		WHERE so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN')
+		  AND ts.generated_at >= NOW() - INTERVAL '1 day' * ?
+		GROUP BY EXTRACT(HOUR FROM ts.generated_at AT TIME ZONE 'Asia/Jakarta'), ts.strategy
+		HAVING COUNT(*) >= 3
+		ORDER BY hour, win_rate DESC
+	`
+
+	if err := r.db.Raw(query, daysBack).Scan(&results).Error; err != nil {
+		return nil, fmt.Errorf("GetTimeOfDayEffectiveness: %w", err)
+	}
+
+	return results, nil
+}
+
+// GetSignalExpectedValues returns expected value calculations for all strategies
+// EV = (Win Rate × Avg Win) - ((1 - Win Rate) × |Avg Loss|)
+func (r *Repository) GetSignalExpectedValues(daysBack int) ([]types.SignalExpectedValue, error) {
+	var results []types.SignalExpectedValue
+
+	query := `
+		WITH strategy_stats AS (
+			SELECT
+				ts.strategy,
+				COUNT(*) as total_signals,
+				SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END)::DECIMAL /
+					NULLIF(SUM(CASE WHEN so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN') THEN 1 ELSE 0 END), 0) as win_rate,
+				COALESCE(AVG(CASE WHEN so.outcome_status = 'WIN' THEN so.profit_loss_pct END), 0) as avg_win_pct,
+				ABS(COALESCE(AVG(CASE WHEN so.outcome_status = 'LOSS' THEN so.profit_loss_pct END), 0)) as avg_loss_pct
+			FROM trading_signals ts
+			JOIN signal_outcomes so ON ts.id = so.signal_id
+			WHERE so.outcome_status IN ('WIN', 'LOSS', 'BREAKEVEN')
+			  AND ts.generated_at >= NOW() - INTERVAL '1 day' * ?
+			GROUP BY ts.strategy
+			HAVING COUNT(*) >= 10
+		)
+		SELECT
+			strategy,
+			ROUND(win_rate * 100, 2) as win_rate,
+			ROUND(avg_win_pct, 4) as avg_win_pct,
+			ROUND(avg_loss_pct, 4) as avg_loss_pct,
+			ROUND((win_rate * avg_win_pct) - ((1 - win_rate) * avg_loss_pct), 4) as expected_value,
+			total_signals,
+			CASE
+				WHEN (win_rate * avg_win_pct) - ((1 - win_rate) * avg_loss_pct) > 0.5 THEN 'STRONG'
+				WHEN (win_rate * avg_win_pct) - ((1 - win_rate) * avg_loss_pct) > 0.2 THEN 'MODERATE'
+				WHEN (win_rate * avg_win_pct) - ((1 - win_rate) * avg_loss_pct) > 0 THEN 'WEAK'
+				ELSE 'AVOID'
+			END as recommendation
+		FROM strategy_stats
+		ORDER BY expected_value DESC
+	`
+
+	if err := r.db.Raw(query, daysBack).Scan(&results).Error; err != nil {
+		return nil, fmt.Errorf("GetSignalExpectedValues: %w", err)
+	}
+
+	return results, nil
+}
