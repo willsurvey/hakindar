@@ -94,9 +94,32 @@ services:
       - stockbit-network
     restart: always
 
+  # Python Screener - Runs on-demand (not always-on)
+  # Usage: docker compose run --rm screener
+  screener:
+    build:
+      context: ./screener
+      dockerfile: Dockerfile.screener
+    container_name: stockbit-screener
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - screener_output:/app/output
+      - ./screener:/app/src:ro
+    networks:
+      - stockbit-network
+    restart: "no"
+
 volumes:
   timescaledb_data:
   token_cache:
+  screener_output:
 
 networks:
   stockbit-network:

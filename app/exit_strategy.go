@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync"
 	"time"
 
 	"stockbit-haka-haki/config"
@@ -35,10 +36,17 @@ type ExitLevels struct {
 	CalculatedAt     time.Time
 }
 
+// volatilityCacheEntry holds a cached volatility value with expiry
+type volatilityCacheEntry struct {
+	value   float64
+	expires time.Time
+}
+
 // ExitStrategyCalculator calculates dynamic exit levels based on ATR
 type ExitStrategyCalculator struct {
-	repo *database.TradeRepository
-	cfg  *config.Config
+	repo           *database.TradeRepository
+	cfg            *config.Config
+	volatilityCache sync.Map // map[string]volatilityCacheEntry — 2min TTL per symbol
 }
 
 // NewExitStrategyCalculator creates a new exit strategy calculator
@@ -102,8 +110,17 @@ func (esc *ExitStrategyCalculator) CalculateATR(symbol string) (float64, error) 
 
 // GetVolatilityPercent returns the current ATR as a percentage of price
 // Implements VolatilityProvider interface
+// Uses in-memory cache with 2-minute TTL to avoid expensive recalculations
 func (esc *ExitStrategyCalculator) GetVolatilityPercent(symbol string) (float64, error) {
-	// Optimization: This should ideally be cached
+	// Check cache first
+	if cached, ok := esc.volatilityCache.Load(symbol); ok {
+		entry := cached.(volatilityCacheEntry)
+		if time.Now().Before(entry.expires) {
+			return entry.value, nil
+		}
+		// Expired — recalculate
+	}
+
 	atr, err := esc.CalculateATR(symbol)
 	if err != nil {
 		return 0, err
@@ -120,7 +137,15 @@ func (esc *ExitStrategyCalculator) GetVolatilityPercent(symbol string) (float64,
 		return 0, fmt.Errorf("zero price for %s", symbol)
 	}
 
-	return (atr / closePrice) * 100, nil
+	result := (atr / closePrice) * 100
+
+	// Cache for 2 minutes
+	esc.volatilityCache.Store(symbol, volatilityCacheEntry{
+		value:   result,
+		expires: time.Now().Add(2 * time.Minute),
+	})
+
+	return result, nil
 }
 
 // GetExitLevels calculates exit levels for a given entry price and symbol

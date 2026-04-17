@@ -18,17 +18,25 @@ import (
 
 // Server handles HTTP API requests
 type Server struct {
-	repo          *database.TradeRepository
-	webhookMq     *notifications.WebhookManager
-	broker        *realtime.Broker
-	llmClient     *llm.Client
-	llmEnabled    bool
-	signalTracker SignalTrackerInterface // Use case for signal tracking
+	repo           *database.TradeRepository
+	webhookMq      *notifications.WebhookManager
+	broker         *realtime.Broker
+	llmClient      *llm.Client
+	llmEnabled     bool
+	signalTracker  SignalTrackerInterface // Use case for signal tracking
+	bootstrapProv  BootstrapProvider      // Bootstrap progress provider
+	portfolioProv  PortfolioProvider      // Virtual portfolio summary
 }
 
 // SignalTrackerInterface defines the interface for signal tracking operations
 type SignalTrackerInterface interface {
 	GetOpenPositions(symbol, strategy string, limit int) ([]database.SignalOutcome, error)
+}
+
+// BootstrapProvider provides bootstrap progress information
+type BootstrapProvider interface {
+	IsBootstrapComplete() bool
+	GetProgress() interface{}
 }
 
 // NewServer creates a new API server instance
@@ -47,6 +55,21 @@ func (s *Server) SetSignalTracker(tracker SignalTrackerInterface) {
 	s.signalTracker = tracker
 }
 
+// SetBootstrapProvider sets the bootstrap progress provider
+func (s *Server) SetBootstrapProvider(bp BootstrapProvider) {
+	s.bootstrapProv = bp
+}
+
+// PortfolioProvider provides portfolio summary
+type PortfolioProvider interface {
+	GetSummary() interface{}
+}
+
+// SetPortfolioProvider sets the portfolio summary provider
+func (s *Server) SetPortfolioProvider(pp PortfolioProvider) {
+	s.portfolioProv = pp
+}
+
 // Start starts the HTTP server on the specified port
 func (s *Server) Start(port int) error {
 	mux := http.NewServeMux()
@@ -59,6 +82,8 @@ func (s *Server) Start(port int) error {
 	s.registerAnalyticsRoutes(mux)
 
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /api/bootstrap/status", s.handleBootstrapStatus)
+	mux.HandleFunc("GET /api/portfolio", s.handlePortfolioSummary)
 
 	// Serve Static Files (Public UI) with Cache Busting for index.html
 	fs := http.FileServer(http.Dir("./public"))
@@ -84,12 +109,47 @@ func (s *Server) Start(port int) error {
 		fs.ServeHTTP(w, r)
 	})
 
-	// Add middleware (gzip -> cors -> logging)
-	handler := s.gzipMiddleware(s.corsMiddleware(s.loggingMiddleware(mux)))
+	// Add middleware (gzip -> cors -> apiKey -> logging)
+	handler := s.gzipMiddleware(s.corsMiddleware(s.apiKeyMiddleware(s.loggingMiddleware(mux))))
 
 	serverAddr := fmt.Sprintf("0.0.0.0:%d", port)
 	log.Printf("🚀 API Server starting on %s", serverAddr)
 	return http.ListenAndServe(serverAddr, handler)
+}
+
+// apiKeyMiddleware protects mutation endpoints (POST/PUT/DELETE) with API key auth
+// GET requests are always allowed (readonly dashboard access)
+// If API_KEY env var is not set, auth is disabled (dev mode)
+func (s *Server) apiKeyMiddleware(next http.Handler) http.Handler {
+	apiKey := os.Getenv("API_KEY")
+	if apiKey == "" {
+		log.Println("⚠️  API_KEY not set — mutation endpoints unprotected (dev mode)")
+		return next // No auth in dev mode
+	}
+
+	log.Println("🔐 API key authentication enabled for POST/PUT/DELETE endpoints")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow all GET requests without auth (readonly)
+		if r.Method == "GET" || r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Check X-API-Key header for mutation requests
+		reqKey := r.Header.Get("X-API-Key")
+		if reqKey == "" {
+			reqKey = r.URL.Query().Get("api_key") // Fallback: query param
+		}
+
+		if reqKey != apiKey {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"unauthorized","message":"valid API key required for mutation endpoints"}`))
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Middleware

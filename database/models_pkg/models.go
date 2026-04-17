@@ -435,3 +435,20 @@ type StockCorrelation struct {
 func (StockCorrelation) TableName() string {
 	return "stock_correlations"
 }
+
+// DailyOHLCV stores daily OHLCV data from Yahoo Finance (period=max, IPO to present)
+// Used for long-term indicators (MA200, trend analysis, support/resistance)
+type DailyOHLCV struct {
+	Date        time.Time `gorm:"primaryKey;type:date" json:"date"`
+	StockSymbol string    `gorm:"primaryKey;type:text;index" json:"stock_symbol"`
+	Open        float64   `gorm:"type:decimal(15,2)" json:"open"`
+	High        float64   `gorm:"type:decimal(15,2)" json:"high"`
+	Low         float64   `gorm:"type:decimal(15,2)" json:"low"`
+	Close       float64   `gorm:"type:decimal(15,2)" json:"close"`
+	Volume      float64   `gorm:"type:decimal(20,0)" json:"volume"`
+	AdjClose    float64   `gorm:"type:decimal(15,2)" json:"adj_close"`
+}
+
+func (DailyOHLCV) TableName() string {
+	return "daily_ohlcv"
+}

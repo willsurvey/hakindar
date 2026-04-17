@@ -114,7 +114,7 @@ func (r *TradeRepository) InitSchema() error {
 	}
 
 	// Auto-migrate remaining tables
-	if err := r.db.db.AutoMigrate(&WhaleWebhook{}); err != nil {
+	if err := r.db.db.AutoMigrate(&WhaleWebhook{}, &models.DailyOHLCV{}); err != nil {
 		return fmt.Errorf("auto-migration failed: %w", err)
 	}
 
@@ -463,6 +463,20 @@ func (r *TradeRepository) setupTimescaleDB() error {
 	fmt.Println("✅ TimescaleDB extension enabled")
 
 	// Create hypertables
+	// Security: whitelist of allowed table names to prevent SQL injection
+	// Even though values are hardcoded, this is defense-in-depth
+	allowedTables := map[string]bool{
+		"running_trades":         true,
+		"whale_alerts":           true,
+		"whale_webhook_logs":     true,
+		"order_flow_imbalance":   true,
+		"statistical_baselines":  true,
+		"signal_outcomes":        true,
+		"trading_signals":        true,
+		"stock_correlations":     true,
+		"detected_patterns":      true,
+	}
+
 	hypertables := []struct {
 		table      string
 		timeColumn string
@@ -475,6 +489,10 @@ func (r *TradeRepository) setupTimescaleDB() error {
 	}
 
 	for _, ht := range hypertables {
+		if !allowedTables[ht.table] {
+			fmt.Printf("⛔ Skipping unknown table: %s\n", ht.table)
+			continue
+		}
 		if err := r.db.db.Exec(`
 			SELECT create_hypertable('` + ht.table + `', '` + ht.timeColumn + `',
 				chunk_time_interval => ` + ht.chunk + `,
@@ -696,6 +714,10 @@ func (r *TradeRepository) GetTradesByTimeRange(symbol string, startTime, endTime
 
 func (r *TradeRepository) GetStockStats(symbol string, lookbackMinutes int) (*types.StockStats, error) {
 	return r.trades.GetStockStats(symbol, lookbackMinutes)
+}
+
+func (r *TradeRepository) GetTradeCount() (int64, error) {
+	return r.trades.GetTradeCount()
 }
 
 func (r *TradeRepository) GetPriceVolumeZScores(symbol string, currentPrice, currentVolume float64, lookbackMinutes int) (*types.ZScoreData, error) {
@@ -987,6 +1009,46 @@ func (r *TradeRepository) GetOrderFlowImbalance(symbol string, startTime, endTim
 
 func (r *TradeRepository) GetLatestOrderFlow(symbol string) (*models.OrderFlowImbalance, error) {
 	return r.analytics.GetLatestOrderFlow(symbol)
+}
+
+func (r *TradeRepository) GetAggregateMarketRegime() (*models.MarketRegime, error) {
+	return r.analytics.GetAggregateMarketRegime()
+}
+
+// DailyOHLCV methods for long-term historical data
+
+func (r *TradeRepository) BatchSaveDailyOHLCV(records []models.DailyOHLCV) error {
+	if len(records) == 0 {
+		return nil
+	}
+	// Batch upsert in chunks of 500
+	chunkSize := 500
+	for i := 0; i < len(records); i += chunkSize {
+		end := i + chunkSize
+		if end > len(records) {
+			end = len(records)
+		}
+		chunk := records[i:end]
+		if err := r.db.db.Save(&chunk).Error; err != nil {
+			return fmt.Errorf("batch save daily_ohlcv: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *TradeRepository) GetDailyOHLCV(symbol string, limit int) ([]models.DailyOHLCV, error) {
+	var records []models.DailyOHLCV
+	err := r.db.db.Where("stock_symbol = ?", symbol).
+		Order("date DESC").
+		Limit(limit).
+		Find(&records).Error
+	return records, err
+}
+
+func (r *TradeRepository) GetDailyOHLCVCount(symbol string) (int64, error) {
+	var count int64
+	err := r.db.db.Model(&models.DailyOHLCV{}).Where("stock_symbol = ?", symbol).Count(&count).Error
+	return count, err
 }
 
 // Webhook management methods (kept for backward compatibility)

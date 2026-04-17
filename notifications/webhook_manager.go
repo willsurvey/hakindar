@@ -166,9 +166,17 @@ func (wm *WebhookManager) shouldSend(hook database.WhaleWebhook, alert *database
 		}
 	}
 
-	// Check Stock Symbol filter
+	// Check Stock Symbol filter (exact match per CSV element)
 	if hook.StockSymbols != "" && hook.StockSymbols != "null" {
-		if !strings.Contains(hook.StockSymbols, alert.StockSymbol) {
+		symbols := strings.Split(hook.StockSymbols, ",")
+		matched := false
+		for _, s := range symbols {
+			if strings.TrimSpace(s) == alert.StockSymbol {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			return false
 		}
 	}

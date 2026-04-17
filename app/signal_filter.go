@@ -76,9 +76,34 @@ func (s *SignalFilterService) Evaluate(signal *database.TradingSignalDB) (bool, 
 }
 
 // GetRegimeAdaptiveLimit returns max positions based on market regime
-// Kept as a separate public method for external usage
+// BULLISH: full capacity, NEUTRAL: 70%, BEARISH: 40%
 func (s *SignalFilterService) GetRegimeAdaptiveLimit(symbol string) int {
-	return s.cfg.Trading.MaxOpenPositions
+	maxPositions := s.cfg.Trading.MaxOpenPositions
+
+	// Get current market regime from database
+	regime, err := s.repo.GetAggregateMarketRegime()
+	if err != nil || regime == nil {
+		return maxPositions // Default to full capacity if regime unknown
+	}
+
+	switch regime.Regime {
+	case "BULLISH":
+		return maxPositions
+	case "NEUTRAL":
+		adjusted := int(float64(maxPositions) * 0.7)
+		if adjusted < 1 {
+			adjusted = 1
+		}
+		return adjusted
+	case "BEARISH":
+		adjusted := int(float64(maxPositions) * 0.4)
+		if adjusted < 1 {
+			adjusted = 1
+		}
+		return adjusted
+	default:
+		return maxPositions
+	}
 }
 
 // ============================================================================

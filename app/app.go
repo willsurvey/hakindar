@@ -17,6 +17,7 @@ import (
 	"stockbit-haka-haki/config"
 	"stockbit-haka-haki/database"
 	"stockbit-haka-haki/handlers"
+	"stockbit-haka-haki/integration"
 	"stockbit-haka-haki/llm"
 	"stockbit-haka-haki/notifications"
 	"stockbit-haka-haki/realtime"
@@ -38,8 +39,11 @@ type App struct {
 	signalTracker   *SignalTracker        // Phase 1: Signal outcome tracking
 	whaleFollowup   *WhaleFollowupTracker // Phase 1: Whale alert followup
 	baselineCalc    *BaselineCalculator   // Phase 2: Statistical baselines
-	correlationAnal *CorrelationAnalyzer  // Phase 3: Stock correlations
-	perfRefresher   *PerformanceRefresher // Phase 3: Performance view refresher
+	correlationAnal  *CorrelationAnalyzer  // Phase 3: Stock correlations
+	perfRefresher    *PerformanceRefresher // Phase 3: Performance view refresher
+	smartBootstrap   *SmartBootstrap       // Cold-start data seeding
+	watchlistSync    *integration.WatchlistSync // Screener ↔ Go integration
+	portfolioManager *PortfolioManager     // Virtual portfolio tracking
 }
 
 // New creates a new application instance
@@ -120,6 +124,18 @@ func (a *App) Start() error {
 	a.broker = realtime.NewBroker()
 	go a.broker.Run()
 
+	// Set up token relay to Redis for Python screener consumption
+	if a.redis != nil {
+		a.authManager.SetTokenUpdateCallback(func(token string) {
+			ctx := context.Background()
+			if err := a.redis.Set(ctx, "stockbit:token", token, 2*time.Hour); err != nil {
+				log.Printf("⚠️ Failed to publish token to Redis: %v", err)
+			} else {
+				log.Println("🔑 Token published to Redis for screener")
+			}
+		})
+	}
+
 	// 3. Authentication
 	if err := a.authManager.EnsureAuthenticated(); err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
@@ -137,6 +153,21 @@ func (a *App) Start() error {
 	// 6. Setup handlers
 	a.setupHandlers()
 
+	// 6.5 Smart Bootstrap: Seed historical data if database is empty
+	a.smartBootstrap = NewSmartBootstrap(a.tradeRepo, a.redis)
+	if a.smartBootstrap.NeedsBootstrap() {
+		log.Println("🚀 Database is empty — starting Smart Bootstrap...")
+		// Run bootstrap in background so WebSocket can start collecting data in parallel
+		go func() {
+			if err := a.smartBootstrap.Run(context.Background()); err != nil {
+				log.Printf("⚠️ Smart Bootstrap failed: %v", err)
+			}
+		}()
+	} else {
+		a.smartBootstrap.isComplete.Store(true)
+		log.Println("✅ Database has existing data — skipping bootstrap")
+	}
+
 	// 7. Initialize LLM client if enabled
 	var llmClient *llm.Client
 	if a.config.LLM.Enabled {
@@ -146,12 +177,21 @@ func (a *App) Start() error {
 		log.Println("ℹ️  LLM Pattern Recognition DISABLED")
 	}
 
-	// 8. Start Phase 1 Enhancement Trackers
+	// 8. Start Watchlist Sync (Screener ↔ Go integration via Redis)
+	if a.redis != nil {
+		a.watchlistSync = integration.NewWatchlistSync(a.redis)
+		go a.watchlistSync.Start(ctx)
+		log.Println("📋 Watchlist Sync started (syncing screener output from Redis)")
+	}
+
+	// 9. Start Phase 1 Enhancement Trackers
 	log.Println("🚀 Starting Phase 1 enhancement trackers...")
 
-	// Signal Outcome Tracker
-	// Signal Outcome Tracker
-	a.signalTracker = NewSignalTracker(a.tradeRepo, a.redis, a.config)
+	// Virtual Portfolio Manager
+	a.portfolioManager = NewPortfolioManager(a.config)
+
+	// Signal Outcome Tracker (with portfolio integration)
+	a.signalTracker = NewSignalTracker(a.tradeRepo, a.redis, a.config, a.watchlistSync, a.portfolioManager)
 	go a.signalTracker.Start()
 
 	// 9. Start API Server (AFTER signal tracker is initialized)
@@ -159,6 +199,16 @@ func (a *App) Start() error {
 
 	// Inject signal tracker into API server BEFORE starting the server
 	apiServer.SetSignalTracker(a.signalTracker)
+
+	// Inject bootstrap provider for /api/bootstrap/status endpoint
+	if a.smartBootstrap != nil {
+		apiServer.SetBootstrapProvider(a.smartBootstrap)
+	}
+
+	// Inject portfolio provider for /api/portfolio endpoint
+	if a.portfolioManager != nil {
+		apiServer.SetPortfolioProvider(a.portfolioManager)
+	}
 
 	// Start API Server after dependencies are initialized
 	go func() {

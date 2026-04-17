@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"stockbit-haka-haki/cache"
 	"stockbit-haka-haki/config"
 	"stockbit-haka-haki/database"
+	"stockbit-haka-haki/integration"
 )
 
 // TradingHours defines Indonesian stock market trading hours (WIB/UTC+7)
@@ -99,13 +101,17 @@ type SignalTracker struct {
 	redis *cache.RedisClient
 	cfg   *config.Config
 	done  chan bool
+	stopOnce sync.Once // Prevents panic from double-close on done channel
 
-	exitCalc      *ExitStrategyCalculator // ATR-based exit strategy calculator
-	filterService *SignalFilterService    // Dedicated service for signal filtering logic
+	exitCalc        *ExitStrategyCalculator          // ATR-based exit strategy calculator
+	filterService   *SignalFilterService             // Dedicated service for signal filtering logic
+	watchlistSync   *integration.WatchlistSync       // Screener watchlist integration (can be nil)
+	exitLevelsCache sync.Map                         // map[int64]*ExitLevels — cached per outcome ID
+	portfolio       *PortfolioManager                // Virtual portfolio for position sizing
 }
 
 // NewSignalTracker creates a new signal outcome tracker
-func NewSignalTracker(repo *database.TradeRepository, redis *cache.RedisClient, cfg *config.Config) *SignalTracker {
+func NewSignalTracker(repo *database.TradeRepository, redis *cache.RedisClient, cfg *config.Config, watchlist *integration.WatchlistSync, portfolio *PortfolioManager) *SignalTracker {
 
 	// Initialize Exit Strategy Calculator
 	exitCalc := NewExitStrategyCalculator(repo, cfg)
@@ -120,6 +126,8 @@ func NewSignalTracker(repo *database.TradeRepository, redis *cache.RedisClient, 
 
 		exitCalc:      exitCalc,
 		filterService: filterService,
+		watchlistSync: watchlist,
+		portfolio:     portfolio,
 	}
 }
 
@@ -168,8 +176,11 @@ func (st *SignalTracker) Start() {
 }
 
 // Stop gracefully stops the tracker
+// Uses sync.Once to prevent panic from double-close on done channel
 func (st *SignalTracker) Stop() {
-	close(st.done)
+	st.stopOnce.Do(func() {
+		close(st.done)
+	})
 }
 
 // trackSignalOutcomes processes open signals and creates/updates outcomes
@@ -315,7 +326,13 @@ func (st *SignalTracker) shouldCreateOutcome(signal *database.TradingSignalDB) (
 	}
 
 	// NEW: Check daily loss limit (circuit breaker)
-	todayStart := time.Now().Truncate(24 * time.Hour)
+	// FIX: Use Jakarta timezone (WIB) instead of UTC for correct daily boundary
+	jakartaLoc, err := time.LoadLocation(MarketTimeZone)
+	if err != nil {
+		jakartaLoc = time.FixedZone("WIB", 7*60*60)
+	}
+	nowJakarta := time.Now().In(jakartaLoc)
+	todayStart := time.Date(nowJakarta.Year(), nowJakarta.Month(), nowJakarta.Day(), 0, 0, 0, 0, jakartaLoc)
 	todayOutcomes, err := st.repo.GetSignalOutcomes("", "", todayStart, time.Time{}, 0, 0)
 	if err == nil {
 		dailyLoss := 0.0
@@ -326,6 +343,33 @@ func (st *SignalTracker) shouldCreateOutcome(signal *database.TradingSignalDB) (
 		}
 		if dailyLoss <= -st.cfg.Trading.MaxDailyLossPct {
 			return false, fmt.Sprintf("Daily loss limit reached (%.2f%% >= %.2f%%)", dailyLoss, st.cfg.Trading.MaxDailyLossPct), 0.0
+		}
+	}
+
+	// NEW: IHSG Safety Gate — Block BUY signals when market is crashing
+	if st.watchlistSync != nil && !st.watchlistSync.IsIHSGSafe() {
+		ihsgTrend := st.watchlistSync.GetIHSGTrend()
+		return false, fmt.Sprintf("IHSG safety gate ACTIVE — market unsafe (trend: %s)", ihsgTrend), 0.0
+	}
+
+	// NEW: Watchlist confidence boost/penalty
+	if st.watchlistSync != nil {
+		watchlistBoost := st.watchlistSync.GetConfidenceBoost(signal.StockSymbol, signal.TriggerPrice)
+		multiplier *= watchlistBoost
+
+		if st.watchlistSync.IsInWatchlist(signal.StockSymbol) {
+			log.Printf("📋 Signal %d (%s): IN watchlist — confidence boost %.1fx",
+				signal.ID, signal.StockSymbol, watchlistBoost)
+		}
+
+		// Entry zone validation: if price is far above screener entry, reduce confidence
+		entry := st.watchlistSync.GetWatchlistEntry(signal.StockSymbol)
+		if entry != nil && entry.Entry1 > 0 && signal.TriggerPrice > 0 {
+			priceDiffPct := ((signal.TriggerPrice - entry.Entry1) / entry.Entry1) * 100
+			if priceDiffPct > 5.0 {
+				log.Printf("⚠️ Signal %d (%s): Price %.0f is %.1f%% above entry zone %.0f — reducing confidence",
+					signal.ID, signal.StockSymbol, signal.TriggerPrice, priceDiffPct, entry.Entry1)
+			}
 		}
 	}
 
@@ -410,6 +454,20 @@ func (st *SignalTracker) createSignalOutcome(signal *database.TradingSignalDB) (
 	if err := st.repo.SaveSignalOutcome(outcome); err != nil {
 		return false, err
 	}
+
+	// Virtual Portfolio: calculate lot size and open position
+	if st.portfolio != nil && signal.Decision == "BUY" {
+		lots := st.portfolio.CalculateLotSize(signal.StockSymbol, signal.TriggerPrice)
+		if lots > 0 {
+			if err := st.portfolio.OpenPosition(signal.StockSymbol, signal.TriggerPrice, lots, signal.ID); err != nil {
+				log.Printf("⚠️ Portfolio: Failed to open position for %s: %v", signal.StockSymbol, err)
+			}
+		} else {
+			log.Printf("⚠️ Portfolio: Cannot size position for %s @ Rp %.0f — insufficient balance or exposure limit",
+				signal.StockSymbol, signal.TriggerPrice)
+		}
+	}
+
 	return true, nil
 }
 
@@ -496,11 +554,23 @@ func (st *SignalTracker) updateSignalOutcome(signal *database.TradingSignalDB, o
 	exitReason := ""
 
 	// Calculate ATR-based exit levels - USE SWING LEVELS FOR SWING TRADES
+	// FIX: Cache exit levels on first calculation to prevent trailing stop drift
 	var exitLevels *ExitLevels
-	if isSwing {
-		exitLevels = st.exitCalc.GetSwingExitLevels(signal.StockSymbol, outcome.EntryPrice)
+	if cached, ok := st.exitLevelsCache.Load(outcome.ID); ok {
+		// Use cached exit levels from first calculation
+		exitLevels = cached.(*ExitLevels)
 	} else {
-		exitLevels = st.exitCalc.GetExitLevels(signal.StockSymbol, outcome.EntryPrice)
+		// First time: calculate and cache
+		if isSwing {
+			exitLevels = st.exitCalc.GetSwingExitLevels(signal.StockSymbol, outcome.EntryPrice)
+		} else {
+			exitLevels = st.exitCalc.GetExitLevels(signal.StockSymbol, outcome.EntryPrice)
+		}
+		st.exitLevelsCache.Store(outcome.ID, exitLevels)
+		log.Printf("📌 Cached exit levels for outcome %d (%s): TSP=%.2f%% ISP=%.2f%% TP1=%.2f%% TP2=%.2f%%",
+			outcome.ID, signal.StockSymbol,
+			exitLevels.TrailingStopPct, exitLevels.InitialStopPct,
+			exitLevels.TakeProfit1Pct, exitLevels.TakeProfit2Pct)
 	}
 
 	// Get current trailing stop (initialize if nil)
@@ -522,7 +592,7 @@ func (st *SignalTracker) updateSignalOutcome(signal *database.TradingSignalDB, o
 		holdingMinutes,
 	)
 
-	// Update trailing stop in outcome
+	// Update trailing stop in outcome (only ratchet up, never down)
 	if newTrailingStop > currentTrailingStop {
 		outcome.TrailingStopPrice = &newTrailingStop
 		log.Printf("📈 Updated trailing stop for %s: %.0f → %.0f",
@@ -611,6 +681,16 @@ func (st *SignalTracker) updateSignalOutcome(signal *database.TradingSignalDB, o
 		} else {
 			outcome.OutcomeStatus = "BREAKEVEN"
 		}
+
+		// Virtual Portfolio: close position and update balance
+		if st.portfolio != nil {
+			if _, err := st.portfolio.ClosePosition(signal.StockSymbol, currentPrice); err != nil {
+				log.Printf("⚠️ Portfolio: %v", err)
+			}
+		}
+
+		// Cleanup cached exit levels for closed position
+		st.exitLevelsCache.Delete(outcome.ID)
 	}
 
 	return st.repo.UpdateSignalOutcome(outcome)

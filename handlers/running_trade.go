@@ -59,6 +59,7 @@ type RunningTradeHandler struct {
 	ingestChan chan *database.Trade
 	whaleChan  chan *database.Trade
 	done       chan struct{}
+	closeOnce  sync.Once // Prevents panic from double-close on channels
 
 	// Order Flow Aggregation (Phase 1 Enhancement)
 	flowAggregator *OrderFlowAggregator
@@ -160,9 +161,12 @@ func (h *RunningTradeHandler) whaleDetectionWorker() {
 }
 
 // Close gracefully shuts down the handler
+// Uses sync.Once to prevent panic from double-close on channels
 func (h *RunningTradeHandler) Close() {
-	close(h.done)
-	close(h.whaleChan) // ingestChan is not closed to avoid panic on send, but loop above has simple exit
+	h.closeOnce.Do(func() {
+		close(h.done)
+		close(h.whaleChan)
+	})
 }
 
 // Handle adalah method legacy - tidak digunakan dengan implementasi protobuf baru
@@ -313,13 +317,17 @@ func (h *RunningTradeHandler) ProcessTrade(t *pb.RunningTrade) {
 		// Drop is acceptable for whale detection under extreme load
 	}
 
-	// 3. Send to Order Flow Aggregator (Non-blocking)
+	// 3. Send to Order Flow Aggregator (Non-blocking to prevent processing stall)
 	if h.flowAggregator != nil {
-		h.flowAggregator.inputChan <- &orderFlowInput{
+		select {
+		case h.flowAggregator.inputChan <- &orderFlowInput{
 			stock:      t.Stock,
 			action:     actionDb,
 			volumeLots: volumeLot,
 			value:      totalAmount,
+		}:
+		default:
+			// Drop order flow update under extreme load to prevent blocking trade processing
 		}
 	}
 
@@ -547,19 +555,7 @@ func getAvgPricePtr(stats *types.StockStats) *float64 {
 	return ptr(stats.MeanPrice)
 }
 
-// containsAny checks if string contains any of the substrings
-func containsAny(s string, substrs []string) bool {
-	for _, substr := range substrs {
-		if len(s) >= len(substr) {
-			for i := 0; i <= len(s)-len(substr); i++ {
-				if s[i:i+len(substr)] == substr {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
+
 
 // ============================================================================
 // Order Flow Aggregation Implementation (Phase 1 Enhancement)

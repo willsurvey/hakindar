@@ -10,7 +10,49 @@ import (
 
 // handleHealth returns the health status of the API
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	health := map[string]interface{}{
+		"status": "ok",
+	}
+
+	// Include bootstrap status if available
+	if s.bootstrapProv != nil {
+		health["bootstrap_complete"] = s.bootstrapProv.IsBootstrapComplete()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(health)
+}
+
+// handleBootstrapStatus returns detailed bootstrap progress
+func (s *Server) handleBootstrapStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if s.bootstrapProv == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"is_complete":  true,
+			"current_step": 0,
+			"total_steps":  0,
+			"message":      "Bootstrap provider not configured",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(s.bootstrapProv.GetProgress())
+}
+
+// handlePortfolioSummary returns virtual portfolio status
+func (s *Server) handlePortfolioSummary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if s.portfolioProv == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "not_configured",
+			"message": "Portfolio manager not initialized",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(s.portfolioProv.GetSummary())
 }
 
 // Configuration Handlers (Webhooks Only)

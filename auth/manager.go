@@ -9,8 +9,9 @@ import (
 
 // AuthManager handles authentication lifecycle including login, token refresh, and persistence.
 type AuthManager struct {
-	client         *AuthClient
-	tokenCacheFile string
+	client          *AuthClient
+	tokenCacheFile  string
+	onTokenUpdate   func(token string) // Called after every token save — used to publish to Redis
 }
 
 // NewAuthManager creates a new AuthManager instance.
@@ -18,6 +19,22 @@ func NewAuthManager(client *AuthClient, tokenCacheFile string) *AuthManager {
 	return &AuthManager{
 		client:         client,
 		tokenCacheFile: tokenCacheFile,
+	}
+}
+
+// SetTokenUpdateCallback sets a callback that fires after every token update.
+// Used by app.go to publish token to Redis for screener consumption.
+func (am *AuthManager) SetTokenUpdateCallback(cb func(token string)) {
+	am.onTokenUpdate = cb
+}
+
+// publishToken calls the onTokenUpdate callback if set
+func (am *AuthManager) publishToken() {
+	if am.onTokenUpdate != nil {
+		token := am.client.GetAccessToken()
+		if token != "" {
+			am.onTokenUpdate(token)
+		}
 	}
 }
 
@@ -60,8 +77,12 @@ func (am *AuthManager) EnsureAuthenticated() error {
 	}
 
 	token := am.client.GetAccessToken()
-	fmt.Printf("📝 Access Token: %s...\n", token[:m(50, len(token))])
+	fmt.Printf("📝 Access Token: %s...\n", token[:min(50, len(token))])
 	fmt.Printf("⏰ Token expires at: %s\n", am.client.GetExpiryTime().Format("2006-01-02 15:04:05"))
+
+	// Publish token to Redis (if callback set)
+	am.publishToken()
+
 	return nil
 }
 
@@ -107,6 +128,9 @@ func (am *AuthManager) RunTokenMonitor(ctx context.Context, onRefreshSuccess fun
 						log.Println("💾 Token cache updated")
 					}
 
+					// Publish token to Redis for screener
+					am.publishToken()
+
 					// Notify callback if provided (e.g., to reconnect WebSocket)
 					if onRefreshSuccess != nil {
 						token := am.client.GetAccessToken()
@@ -125,9 +149,3 @@ func (am *AuthManager) GetClient() *AuthClient {
 	return am.client
 }
 
-func m(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

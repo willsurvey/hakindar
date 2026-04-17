@@ -226,6 +226,17 @@ func (r *Repository) GetActiveSymbols(since time.Time) ([]string, error) {
 	return symbols, nil
 }
 
+// GetTradeCount returns the total number of running_trades records
+// Used by SmartBootstrap to determine if seeding is needed
+func (r *Repository) GetTradeCount() (int64, error) {
+	var count int64
+	err := r.db.Table("running_trades").Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("GetTradeCount: %w", err)
+	}
+	return count, nil
+}
+
 // GetTradesByTimeRange retrieves trades for a symbol within a time range
 func (r *Repository) GetTradesByTimeRange(symbol string, startTime, endTime time.Time) ([]models.Trade, error) {
 	var trades []models.Trade

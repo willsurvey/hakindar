@@ -2,6 +2,10 @@ package auth
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -77,7 +81,7 @@ func NewAuthClient(creds Credentials) *AuthClient {
 	}
 }
 
-// SaveTokenToFile saves token data to file
+// SaveTokenToFile saves token data to file, encrypted if TOKEN_ENCRYPTION_KEY is set
 func (ac *AuthClient) SaveTokenToFile(filepath string) error {
 	ac.mu.RLock()
 	data := struct {
@@ -98,6 +102,22 @@ func (ac *AuthClient) SaveTokenToFile(filepath string) error {
 		return fmt.Errorf("failed to marshal token data: %w", err)
 	}
 
+	// Encrypt if TOKEN_ENCRYPTION_KEY is set
+	encKey := os.Getenv("TOKEN_ENCRYPTION_KEY")
+	if encKey != "" {
+		encrypted, err := encryptAESGCM(jsonData, encKey)
+		if err != nil {
+			log.Printf("⚠️ Encryption failed, saving plaintext: %v", err)
+		} else {
+			// Prefix with "ENC:" marker so LoadTokenFromFile can detect format
+			markedData := append([]byte("ENC:"), encrypted...)
+			if err := os.WriteFile(filepath, markedData, 0600); err != nil {
+				return fmt.Errorf("failed to write encrypted token file: %w", err)
+			}
+			return nil
+		}
+	}
+
 	if err := os.WriteFile(filepath, jsonData, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %w", err)
 	}
@@ -105,14 +125,31 @@ func (ac *AuthClient) SaveTokenToFile(filepath string) error {
 	return nil
 }
 
-// LoadTokenFromFile loads token data from file
+// LoadTokenFromFile loads token data from file, auto-detecting encrypted vs plaintext
 func (ac *AuthClient) LoadTokenFromFile(filepath string) error {
-	data, err := os.ReadFile(filepath)
+	rawData, err := os.ReadFile(filepath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("token file not found")
 		}
 		return fmt.Errorf("failed to read token file: %w", err)
+	}
+
+	var jsonData []byte
+
+	// Check if file is encrypted (starts with "ENC:")
+	if len(rawData) > 4 && string(rawData[:4]) == "ENC:" {
+		encKey := os.Getenv("TOKEN_ENCRYPTION_KEY")
+		if encKey == "" {
+			return fmt.Errorf("token file is encrypted but TOKEN_ENCRYPTION_KEY not set")
+		}
+		decrypted, err := decryptAESGCM(rawData[4:], encKey)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt token file: %w", err)
+		}
+		jsonData = decrypted
+	} else {
+		jsonData = rawData
 	}
 
 	var tokenCache struct {
@@ -122,7 +159,7 @@ func (ac *AuthClient) LoadTokenFromFile(filepath string) error {
 		UserID       int64     `json:"user_id"`
 	}
 
-	if err := json.Unmarshal(data, &tokenCache); err != nil {
+	if err := json.Unmarshal(jsonData, &tokenCache); err != nil {
 		return fmt.Errorf("failed to parse token file: %w", err)
 	}
 
@@ -134,6 +171,57 @@ func (ac *AuthClient) LoadTokenFromFile(filepath string) error {
 	ac.tokenData.UserID = tokenCache.UserID
 
 	return nil
+}
+
+// encryptAESGCM encrypts data using AES-256-GCM
+func encryptAESGCM(plaintext []byte, hexKey string) ([]byte, error) {
+	key, err := hex.DecodeString(hexKey)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("TOKEN_ENCRYPTION_KEY must be 64 hex chars (32 bytes)")
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// decryptAESGCM decrypts AES-256-GCM encrypted data
+func decryptAESGCM(ciphertext []byte, hexKey string) ([]byte, error) {
+	key, err := hex.DecodeString(hexKey)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("TOKEN_ENCRYPTION_KEY must be 64 hex chars (32 bytes)")
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, ciphertext, nil)
 }
 
 // Login melakukan autentikasi dan menyimpan token
@@ -254,8 +342,13 @@ func (ac *AuthClient) RefreshToken() error {
 
 // GetValidToken mengembalikan token yang valid, auto-refresh jika diperlukan
 func (ac *AuthClient) GetValidToken() (string, error) {
-	// Check jika token akan expired dalam 5 menit
-	if time.Now().UTC().Add(5 * time.Minute).After(ac.tokenData.ExpiresAt) {
+	// Read token expiry under read lock to prevent data race
+	ac.mu.RLock()
+	needsRefresh := time.Now().UTC().Add(5 * time.Minute).After(ac.tokenData.ExpiresAt)
+	ac.mu.RUnlock()
+
+	// Refresh if token will expire within 5 minutes
+	if needsRefresh {
 		fmt.Println("🔄 Token akan expired, melakukan refresh...")
 		if err := ac.RefreshToken(); err != nil {
 			return "", fmt.Errorf("failed to refresh token: %w", err)
@@ -263,7 +356,10 @@ func (ac *AuthClient) GetValidToken() (string, error) {
 		fmt.Println("✅ Token berhasil di-refresh!")
 	}
 
-	return ac.tokenData.AccessToken, nil
+	ac.mu.RLock()
+	token := ac.tokenData.AccessToken
+	ac.mu.RUnlock()
+	return token, nil
 }
 
 // GetAccessToken mengembalikan access token

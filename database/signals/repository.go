@@ -623,15 +623,23 @@ func (r *Repository) GetStrategySignals(lookbackMinutes int, minConfidence float
 		// Get detected patterns for this symbol
 		patterns, _ := r.analytics.GetRecentPatterns(alert.StockSymbol, time.Now().Add(-2*time.Hour))
 
-		// Calculate VWAP from baseline (Approximate Session VWAP using Mean Value / Mean Volume)
+		// Calculate VWAP from order flow data (real VWAP, not approximation)
 		var vwap float64
-		if zscores.MeanVolume > 0 {
-			// Estimate VWAP from MeanPrice - this is an approximation but useful for trend
+		orderFlow, _ := r.analytics.GetLatestOrderFlow(alert.StockSymbol)
+		if orderFlow != nil {
+			totalVolume := orderFlow.BuyVolumeLots + orderFlow.SellVolumeLots
+			totalValue := orderFlow.BuyValue + orderFlow.SellValue
+			if totalVolume > 0 {
+				vwap = totalValue / totalVolume // True VWAP = TotalValue / TotalVolume
+			}
+		}
+		if vwap == 0 && zscores.MeanPrice > 0 {
+			// Fallback: use MeanPrice as VWAP approximation
 			vwap = zscores.MeanPrice
 		}
 
-		// Fetch Latest Order Flow for Confirmation
-		orderFlow, _ := r.analytics.GetLatestOrderFlow(alert.StockSymbol)
+
+		// orderFlow already fetched above for VWAP calculation
 
 		// Evaluate each strategy
 		strategies := []string{"VOLUME_BREAKOUT", "MEAN_REVERSION", "FAKEOUT_FILTER"}

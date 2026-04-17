@@ -83,6 +83,11 @@ type TradingConfig struct {
 	SwingPositionSizePct float64 // Position size as % of portfolio for swing
 	SwingRequireTrend    bool    // Require strong trend confirmation for swing
 
+	// Virtual Portfolio Management
+	TradingBalance       float64 // Starting virtual balance (default Rp 200,000)
+	MaxPositionPct       float64 // Max % of balance per single position (default 10%)
+	MaxTotalExposurePct  float64 // Max % of balance exposed across all positions (default 70%)
+
 	// Testing & Simulation
 	MockTradingMode bool // Bypass strict market hours and trend checks for simulation
 }
@@ -154,13 +159,18 @@ func LoadFromEnv() *Config {
 			BreakevenBufferPct:  getEnvFloat("TRADING_BREAKEVEN_BUFFER_PCT", 0.15), // Set stop at +0.15% to cover fees
 
 			// Swing Trading Configuration - NEW
-			EnableSwingTrading:   getEnvOrDefault("SWING_TRADING_ENABLED", "true") == "false", // Disabled by default
+			EnableSwingTrading:   getEnvOrDefault("SWING_TRADING_ENABLED", "false") == "true", // Disabled by default, set env to "true" to enable
 			SwingMinConfidence:   getEnvFloat("SWING_MIN_CONFIDENCE", 0.75),                   // Higher threshold for swing
 			SwingMaxHoldingDays:  getEnvInt("SWING_MAX_HOLDING_DAYS", 30),                     // Max 30 days
 			SwingATRMultiplier:   getEnvFloat("SWING_ATR_MULTIPLIER", 3.0),                    // More lenient than day trading (1.5)
 			SwingMinBaselineDays: getEnvInt("SWING_MIN_BASELINE_DAYS", 20),                    // Need 20 days of history
 			SwingPositionSizePct: getEnvFloat("SWING_POSITION_SIZE_PCT", 5.0),                 // 5% of portfolio
 			SwingRequireTrend:    getEnvOrDefault("SWING_REQUIRE_TREND", "true") == "true",    // Require trend confirmation
+
+			// Virtual Portfolio Management
+			TradingBalance:       getEnvFloat("TRADING_BALANCE", 200000),         // Default Rp 200K
+			MaxPositionPct:       getEnvFloat("MAX_POSITION_PCT", 10.0),          // Max 10% per position
+			MaxTotalExposurePct:  getEnvFloat("MAX_TOTAL_EXPOSURE_PCT", 70.0),    // Max 70% total
 
 			// Testing & Simulation
 			MockTradingMode: getEnvOrDefault("MOCK_TRADING_MODE", "true") == "true",
