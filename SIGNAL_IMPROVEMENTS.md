@@ -1,199 +1,72 @@
-# Perbaikan Kodebase Trading Signal - Stockbit Whale Analysis
+# 🧠 Logika Perbaikan Sinyal & Manajemen Risiko
 
-## Ringkasan Perubahan
+*Kembali ke [Halaman Utama](README.md)*
 
-Kodebase telah diperbaiki secara signifikan untuk menghasilkan sinyal trading yang lebih berkualitas dengan fokus pada:
-1. **Kualitas sinyal lebih tinggi** - Filter lebih ketat
-2. **Risk management lebih baik** - Daily loss limit dan circuit breaker
-3. **Exit strategy lebih optimal** - Breakeven dan time-decay profit taking
-4. **Konsistensi confidence calculation** - Algoritma yang lebih matang
+Kodebase telah diperbaiki secara signifikan untuk menghasilkan sinyal trading yang lebih berkualitas tinggi. Pembaruan terbaru menggeser paradigma dari "menolak sinyal secara paksa" menjadi "membobot probabilitas sinyal".
 
----
+## 1. Filter Pipeline Berbasis Statistik
 
-## 1. Konfigurasi Trading yang Diperketat (config/config.go)
+Sistem `SignalFilter` (pada `app/signal_filter.go`) kini difokuskan pada pengolahan kelayakan berbasis angka.
 
-### Perubahan Nilai Default:
+### a. Gerbang Keselamatan Pasar (IHSG Safety Gate)
+Dilengkapi dengan suplai data dari Python Screener via Redis, kini sistem akan membaca `Regime Pasar`.
+- Jika pasar berada dalam fase `BEARISH` yang sangat dalam, sistem bisa memveto (membatalkan) sinyal `BUY` dari saham-saham individual untuk melindungi Anda dari arus jual besar-besaran (Market Crash Protection).
 
-| Parameter | Nilai Lama | Nilai Baru | Alasan |
-|-----------|-----------|-----------|---------|
-| MinSignalIntervalMinutes | 15 | 20 | Mengurangi over-trading |
-| MaxOpenPositions | 10 | 8 | Fokus pada posisi berkualitas |
-| SignalTimeWindowMinutes | 5 | 10 | Menghindari duplikat lebih baik |
-| MinBaselineSampleSize | 30 | 50 | Data baseline lebih reliable |
-| MinBaselineSampleSizeStrict | 50 | 100 | Standar lebih tinggi |
-| MinStrategySignals | 10 | 15 | Evaluasi strategi lebih akurat |
-| LowWinRateThreshold | 40.0 | 45.0 | Reject strategi underperform lebih cepat |
-| HighWinRateThreshold | 65.0 | 70.0 | Standar "bagus" lebih tinggi |
-| MaxHoldingLossPct | 5.0 | 3.0 | Cut loss lebih ketat |
-| StopLossATRMultiplier | 2.0 | 1.5 | Stop loss lebih ketat |
-| TrailingStopATRMultiplier | 2.5 | 2.0 | Trailing stop lebih ketat |
-| TakeProfit1ATRMultiplier | 4.0 | 3.0 | Profit lebih cepat |
-| TakeProfit2ATRMultiplier | 8.0 | 6.0 | Target lebih realistis |
+### b. Filter Kinerja Strategi (*Strategy Performance*)
+- **Baseline Recency Check**: Mengutamakan data *baseline* (seperti VWAP & ATR) yang sangat *up-to-date*. Ini bisa terwujud karena sistem otomatis mengunduh 60 hari data intraday terbaru melalui fitur **Smart Bootstrap**.
+- **Consecutive Losses Circuit Breaker**: Mengurangi *multiplier* (peluang lolos sinyal) apabila sebuah strategi terlalu sering mengalami kerugian beruntun.
+- Alih-alih langsung membuang sinyal jika sebuah ambang batas (*threshold*) tak tercapai, sistem akan membiarkan sinyal lolos dengan **persentase kepercayaan (Confidence) yang dikurangi**.
 
-### Parameter Baru:
-- **MaxDailyLossPct**: 5.0% - Batas kerugian harian
-- **MaxConsecutiveLosses**: 3 - Circuit breaker setelah 3 loss berturut-turut
-- **BreakevenTriggerPct**: 1.0% - Aktivasi breakeven pada profit 1%
-- **BreakevenBufferPct**: 0.15% - Stop loss dipindahkan ke +0.15% (cover biaya)
+### c. Filter Kepercayaan Dinamis (*Dynamic Confidence*)
+- **Ambang Batas Volume Tinggi**: Terjadi jika Z-Score Volume > 3.0. Sinyal yang disertai dengan lonjakan volume fantastis akan mendapatkan **bonus multiplier 1,3x**.
+
+*(Catatan: Aturan jam malam atau filter pesanan mutlak telah dicabut karena merusak sinyal-sinyal probabilitas tinggi pada waktu tidak biasa.)*
 
 ---
 
-## 2. Filter Pipeline Berbasis Statistik (app/signal_filter.go)
+## 2. Manajemen Risiko & Portofolio Virtual
 
-### Strategy Performance Filter:
-- ✅ **Baseline recency check**: Data baseline harus kurang dari 2 jam untuk mendapat multiplier optimal.
-- ✅ **Consecutive losses circuit breaker**: Modifikasi multiplier jika strategi mengalami banyak loss berturut-turut.
-- ✅ **Purely Statistical**: Filter ini tidak lagi menolak (reject) sinyal secara sepihak jika threshold tidak terpenuhi, melainkan hanya menyesuaikan multiplier probabilitas.
+Bekerja berdampingan dengan `PortfolioManager` (pada `app/portfolio_manager.go`), kini sistem memitigasi kerugian tidak hanya dengan persentase angka, tetapi dengan eksekusi ukuran lot virtual.
 
-### Dynamic Confidence Filter:
-- ✅ **High volume threshold**: Volume Z-Score > 3.0 (dari 2.5)
-- ✅ **Very high volume bonus**: Z > 4.0 + trend aligned = 1.3x multiplier
-- ✅ **Purely Statistical**: Filter ini tidak lagi menolak sinyal yang confidence-nya di bawah batas optimal, melainkan membiarkannya lewat dengan mencatat alasannya. VWAP trend rejection juga telah dihapus.
+### a. Position Sizing (Penentuan Ukuran Lot)
+- Menggunakan parameter `MAX_POSITION_PCT` (default 10%).
+- Jika saldo virtual Rp200.000, maka setiap posisi *buy* maksimal memakan alokasi sebesar Rp20.000, berapa pun harga sahamnya.
+- Saat IHSG sedang tidak stabil (`NEUTRAL`), ukuran lot yang boleh masuk akan dikompresi menjadi 70%.
 
-*(Catatan: `OrderFlowFilter` dan `TimeOfDayFilter` beserta aturan ketat lainnya telah dihapus sepenuhnya untuk memberi jalan pada sistem filter yang 100% berbasis statistik dan multiplier.)*
+### b. Biaya Transaksi Realistis (Fee)
+Agar *win-rate* bukan sebatas angka manis, kriteria untuk mengklasifikasikan hasil sinyal menjadi `WIN` telah diubah:
+- Ambang batas bukan lagi `0.0%`, melainkan **`0.25%`**. Hal ini untuk menutupi biaya sekuritas standar di Indonesia (0,15% beli, 0,10% jual).
 
----
-
-## 3. Exit Strategy yang Lebih Baik (app/exit_strategy.go)
-
-### Breakeven Mechanism:
-```go
-// Sebelumnya: Fixed 50% of TP1
-if profitLossPct >= (TP1 / 2) {
-    stop = entry * 1.001
-}
-
-// Sekarang: Configurable
-if profitLossPct >= BreakevenTriggerPct {  // 1.0%
-    stop = entry * (1 + BreakevenBufferPct/100)  // +0.15%
-}
-```
-
-### Time-Decay Profit Taking:
-```go
-// Baru: Reduce profit target as time passes
-if holdingMinutes > 120 && holdingMinutes < 240 {
-    adjustedTP1 := TP1 * (1.0 - float64(holdingMinutes-120)/120.0*0.4)
-    // Setelah 2 jam: TP1 berkurang 20%
-    // Setelah 3 jam: TP1 berkurang 40%
-}
-```
-
-### Enhanced Max Holding:
-- Profit > 0.15%: Exit dengan profit
-- Profit -0.5% sampai 0.15%: Exit near breakeven
-- Loss > 0.5%: Biarkan stop loss bekerja
+### c. Pemutus Sirkuit Beruntun (*Circuit Breaker*)
+Sistem memiliki pengaman di level aplikasi:
+- **MaxDailyLossPct (Maksimum Kerugian Harian)**: Batas kerugian hingga `5.0%`.
+- **MaxConsecutiveLosses (Maksimum Kerugian Beruntun)**: Sistem otomatis berhenti memproses aksi `BUY` jika mencapai 3x kerugian berturut-turut pada hari itu.
 
 ---
 
-## 4. Daily Loss Limit & Circuit Breaker (app/signal_tracker.go)
+## 3. Strategi Keluar (*Exit Strategy*) yang Lebih Cerdas
 
-### Fitur Baru:
-```go
-// Check daily loss limit
-if dailyLoss <= -MaxDailyLossPct {  // -5.0%
-    return false, "Daily loss limit reached"
-}
-```
+Berada di `app/exit_strategy.go`, mekanisme ini dirancang untuk menjaga profit yang sudah susah payah didapatkan.
 
-### Outcome Classification:
-```go
-// Sebelumnya: Fixed 0.2% threshold
-if profitLossPct > 0.2 { WIN }
+### a. Mekanisme Titik Impas (*Breakeven Mechanism*)
+Daripada memasang limit secara persentase, sekarang bisa dikonfigurasi fleksibel:
+- **BreakevenTriggerPct**: 1.0% (sistem mengaktifkan tameng perlindungan modal jika posisi surplus 1%).
+- **BreakevenBufferPct**: 0.15% (menggeser stop loss asli Anda ke +0.15% di atas titik masuk/entry, mengunci keuntungan kecil yang menutupi *fee* sekuritas).
 
-// Sekarang: Account for trading fees (0.25% total)
-const feeThreshold = 0.25
-if profitLossPct > feeThreshold { WIN }  // > 0.25%
-```
+### b. Profit-Taking Berbasis Peluruhan Waktu (*Time-Decay*)
+Saham yang diam tak bergerak akan kehilangan momentum.
+- Jika setelah 2 jam harga tidak menyentuh Target Profit 1 (TP1), maka target TP1 tersebut diturunkan secara progresif sebesar 20%.
+- Tujuannya agar sistem mencairkan (*liquidate*) posisi lebih awal pada perdagangan mandek.
+
+### c. Perlindungan Pergeseran Stop Loss (*Trailing Stop Drift*)
+- *Trailing Stop* diamankan ke *cache*. Ketika ATR dihitung ulang, stop loss hanya bisa bergerak **naik** (mengamankan profit) dan tidak akan pernah turun kembali.
 
 ---
 
-## 5. Confidence Calculation yang Konsisten (database/signals/repository.go)
+## 📊 Hasil yang Diharapkan
 
-### Sigmoid-like Curve:
-```go
-// Sebelumnya: Linear interpolation
-confidence = ratio
+1. **Win Rate Lebih Realistis**: Biaya layanan bursa (0,25%) disertakan, sehingga label kemenangan (`WIN`) jauh lebih bisa diandalkan.
+2. **Kehancuran Modal yang Diminimalkan**: Konfigurasi portofolio dengan *circuit breaker* memastikan modal tak tersedot di kala pasar berantakan.
+3. **Peluang Emas Lebih Tinggi**: Berubahnya blok pemblokiran statis menjadi sistem pengali (*multiplier*) mengurangi jumlah sinyal yang tertolak konyol tanpa perhitungan logika matematis.
 
-// Sekarang: Quadratic ease-out
-confidence = ratio * (2 - ratio)
-
-// Acceleration near top
-if ratio > 0.8 {
-    confidence = 0.8 + (ratio-0.8)*1.5
-}
-
-// Minimum 0.3 (avoid extremely low confidence)
-if confidence < 0.3 { confidence = 0.3 }
-```
-
-### Volume Breakout Strategy - Stricter:
-- Threshold: Price Z > 2.5, Volume Z > 3.0 (dari 2.0/2.5)
-- Confidence: Weighted average (60% volume, 40% price)
-- NO_TRADE jika below VWAP (reject counter-trend)
-
-### Mean Reversion Strategy - Stricter:
-- Threshold: Price Z > 3.5 atau < -3.5 (dari 3.0)
-- Deep value: 7% below VWAP (dari 5%)
-- Smart money: >45% aggressive buy (dari 30%)
-- Strong requirement: Deep value AND smart money
-
----
-
-## 6. Hasil yang Diharapkan
-
-### Kualitas Sinyal:
-- **Win rate lebih tinggi**: Filter ketat memilih sinyal berkualitas
-- **Drawdown lebih kecil**: Daily loss limit dan tighter stops
-- **Profit lebih konsisten**: Time-decay profit taking
-
-### Risk Management:
-- **Maximum daily loss**: 5% hard limit
-- **Circuit breaker**: Stop trading setelah 3 consecutive losses
-- **Position sizing**: Max 8 posisi untuk fokus
-
-### Exit Performance:
-- **Breakeven protection**: 1% trigger dengan 0.15% buffer
-- **Time-based exits**: Maksimal 4 jam holding
-- **Fee consideration**: Threshold 0.25% (realistic)
-
----
-
-## 7. Monitoring & Tuning
-
-### Metrics yang Perlu Dipantau:
-1. Win rate per strategi (target: >50%)
-2. Average profit/loss per trade
-3. Daily P&L tracking
-4. Consecutive losses counter
-5. Signal frequency (jangan terlalu banyak)
-
-### Parameter yang Bisa Dituning:
-- `MaxDailyLossPct`: Naikkan jika terlalu sering stop
-- `BreakevenTriggerPct`: Turunkan jika terlalu cepat breakeven
-- `MaxHoldingLossPct`: Sesuaikan dengan volatilitas pasar
-- `MinBaselineSampleSize`: Turunkan untuk saham baru
-
----
-
-## 8. Catatan Penting
-
-### ⚠️ Perubahan Breaking:
-1. **Penghapusan Aturan Ketat**: Sistem filter tidak lagi menolak sinyal berdasarkan win rate, confidence, order flow, atau waktu trading. Semua sinyal akan diproses dan dievaluasi kemungkinannya murni menggunakan *statistical multiplier*.
-2. **BUY only**: Sistem masih hanya support long positions (Indonesia market)
-
-### ✅ Keuntungan:
-1. **Signal quality > quantity**: Lebih sedikit sinyal tapi win rate lebih tinggi
-2. **Better risk management**: Daily limits dan circuit breakers
-3. **Consistent exits**: Breakeven dan time-decay mechanisms
-4. **Fee-aware**: Outcome classification memperhitungkan biaya trading
-
----
-
-## Checklist Deployment
-
-- [ ] Update environment variables jika perlu
-- [ ] Pastikan Redis berjalan (untuk caching)
-- [ ] Monitor log pertama 1-2 jam untuk melihat signal frequency
-- [ ] Cek win rate harian untuk tuning parameter
-- [ ] Review daily P&L untuk adjust MaxDailyLossPct jika perlu
+👉 *Ingin mencobanya membiarkan aset Anda tumbuh semalaman tanpa pantauan harian?* Baca **[Panduan Swing Trading](SWING_TRADING.md)**.

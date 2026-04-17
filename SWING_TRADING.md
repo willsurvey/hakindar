@@ -1,237 +1,105 @@
-# Swing Trading Support
+# 🌙 Panduan Swing Trading
 
-## Overview
+*Kembali ke [Halaman Utama](README.md)* | *Lihat [Logika Perbaikan Sinyal](SIGNAL_IMPROVEMENTS.md)*
 
-Sistem trading kini mendukung **Swing Trading** selain Day Trading. Swing trades dapat menahan posisi overnight dan hingga 30 hari (configurable).
+## Gambaran Umum
 
-## Konfigurasi
+Selain eksekusi kilat (Day Trading), sistem trading ini juga mendukung **Swing Trading**. Anda bisa menahan aset yang menjanjikan melintasi malam (*overnight*) hingga kurun waktu 30 hari (dapat disesuaikan) tanpa dicairkan secara paksa saat bursa tutup.
 
-Tambahkan ke `.env` file:
+---
+
+## ⚙️ Konfigurasi `.env`
+
+Tambahkan variabel berikut ke dalam file `.env` Anda jika belum ada:
 
 ```env
 # Swing Trading Configuration
-SWING_TRADING_ENABLED=true          # Enable swing trading (default: false)
-SWING_MIN_CONFIDENCE=0.75           # Minimum confidence for swing (default: 0.75)
-SWING_MAX_HOLDING_DAYS=30           # Max holding period in days (default: 30)
-SWING_ATR_MULTIPLIER=3.0            # ATR multiplier for exit levels (default: 3.0)
-SWING_MIN_BASELINE_DAYS=20          # Min 20 days of history required
-SWING_POSITION_SIZE_PCT=5.0         # Position size as % of portfolio
-SWING_REQUIRE_TREND=true            # Require strong trend confirmation
+SWING_TRADING_ENABLED=true          # Mengaktifkan mode Swing (default: false)
+SWING_MIN_CONFIDENCE=0.75           # Kepercayaan minimum yang tinggi (default: 0.75)
+SWING_MAX_HOLDING_DAYS=30           # Lama memegang posisi maksimal (default: 30 hari)
+SWING_ATR_MULTIPLIER=3.0            # Pengali ATR untuk ruang bernapas volatilitas (default: 3.0)
+SWING_MIN_BASELINE_DAYS=20          # Minimal harus ada data historis 20 hari
+SWING_POSITION_SIZE_PCT=5.0         # Alokasi % saldo per posisi Swing
+SWING_REQUIRE_TREND=true            # Mutlak butuh konfirmasi tren menguat
 ```
 
-## Perbedaan Day Trading vs Swing Trading
+---
 
-| Aspek | Day Trading | Swing Trading |
-|-------|-------------|---------------|
-| **Holding Period** | Max 4 jam | Max 30 hari |
-| **Auto-close Market** | Ya (16:00 WIB) | Tidak (hold overnight) |
-| **Stop Loss** | 1.5x ATR | 4.5x ATR |
-| **Take Profit 1** | 3x ATR | 9x ATR |
-| **Take Profit 2** | 6x ATR | 18x ATR |
-| **Min Confidence** | 0.50 | 0.75 |
-| **Min Baseline** | 50 samples | 400 samples (20 hari) |
-| **Trend Required** | Above VWAP | Strong trend (score > 0.6) |
+## ⚖️ Perbandingan Ekstrem: Day vs Swing
 
-## Kriteria Swing Trade
+| Atribut Penentu | Day Trading ⚡ | Swing Trading 🌙 |
+|-----------------|----------------|-------------------|
+| **Durasi Pegang** | Maksimal 4 jam | Maksimal 30 hari |
+| **Penutupan Pasar**| Tutup Paksa jam 16:00 WIB | Hold Overnight (dipertahankan) |
+| **Stop Loss** | Sempit (1,5x ATR) | Lebar (4,5x ATR Harian) |
+| **Take Profit 1** | 3x ATR | 9x ATR Harian |
+| **Take Profit 2** | 6x ATR | 18x ATR Harian |
+| **Minimal Baseline**| 50 data lilin (candles) | 400 data lilin (sekitar 20 hari) |
+| **Level Keyakinan** | Standar (0,50) | Ekstra Tinggi (0,75) |
 
-Sinyal akan dianggap sebagai **Swing Trade** jika memenuhi:
+---
 
-### 1. **Confidence Tinggi**
-   - Signal confidence ≥ 0.75
-   - Lebih tinggi dari threshold day trading (0.50)
+## 🔍 Empat Syarat Mutlak Menjadi "Swing Trade"
 
-### 2. **Historical Data Cukup**
-   - Minimum 20 hari data historis
-   - Setara dengan ~400 samples (asumsi 20 trade/hari)
+Setiap sinyal `BUY` yang muncul akan dites oleh sistem. Jika lolos empat uji di bawah, ia diizinkan masuk kandang Swing Trading:
 
-### 3. **Trend Strength**
-   - Price di atas VWAP
-   - Trend score ≥ 0.6 (dihitung dari price vs VWAP dan Z-score)
-   - Volume confirmation baik
-
-### 4. **Swing Score**
+1. **Keyakinan (*Confidence*) Premium**: Harus ≥ 0.75.
+2. **Kekayaan Data Historis**: Harus memiliki data 20 hari terakhir. Jika tidak, perhitungan ATR Harian tidak akan presisi. **(Sistem Smart Bootstrap akan memfasilitasi penarikan ini saat inisialisasi awal)**.
+3. **Kekuatan Tren Di Atas VWAP**: Posisi harga wajib di atas Volume-Weighted Average Price, dan skor tren ≥ 0.6.
+4. **Swing Score Gabungan**:
    ```
-   Swing Score = (Confidence × 0.4) + (Trend × 0.4) + (Volume × 0.2)
-   Minimum: 0.65
+   Swing Score = (Keyakinan × 0.4) + (Kekuatan Tren × 0.4) + (Lonjakan Volume × 0.2)
    ```
+   *Skor akhir harus ≥ 0.65.*
 
-## Exit Strategy untuk Swing
+---
 
-### ATR-Based Levels (Swing)
+## 🛡️ Strategi Exit untuk Mode Swing
+
+### Penentuan Titik Menggunakan ATR Harian
+Sistem menggunakan hitungan ATR Harian, yang artinya jarak *stop-loss* jauh lebih renggang (mengantisipasi gap harga pembukaan esok harinya).
 ```go
-// Swing menggunakan daily ATR, bukan 5-min ATR
-Stop Loss    = Daily ATR × 3.0 × 1.5  // 4.5x daily ATR
-Trailing Stop = Daily ATR × 3.0        // 3x daily ATR
-Take Profit 1 = Daily ATR × 3.0 × 3.0  // 9x daily ATR
-Take Profit 2 = Daily ATR × 3.0 × 6.0  // 18x daily ATR
+Stop Loss      = Daily ATR × 3.0 × 1.5  // 4,5x ruang toleransi kerugian
+Trailing Stop  = Daily ATR × 3.0        // Mengunci profit pelan-pelan
+Take Profit 1  = Daily ATR × 3.0 × 3.0  // Target 9x
+Take Profit 2  = Daily ATR × 3.0 × 6.0  // Target Puncak 18x
 ```
 
-### Time-Based Exits
-- **Day Trade**: Max 240 menit (4 jam)
-- **Swing Trade**: Max 30 hari (configurable)
+### Mengapa Toleransi Stop-Loss Dilebarkan?
+Hal ini sangat krusial agar aset tidak tersapu (*stop-out*) oleh kepanikan pagi hari (volatilitas pukul 09.00 - 09.15) saat pembukaan pasar BEI, sebelum akhirnya pasar merangkak naik lagi sepanjang hari.
 
-### Market Close Behavior
-- **Day Trade**: Auto-close jam 16:00 WIB
-- **Swing Trade**: Tetap hold, lanjut besok
+---
 
-## Monitoring Swing Trades
+## 🚦 Studi Kasus Skenario
 
-### API Endpoints
+### Kasus 1: Kelayakan Sempurna (Swing Mode)
+Sebuah sinyal memicu pembelian saham `BBCA`:
+- **Keyakinan**: 0.82
+- **Posisi Harga**: 8% di atas VWAP
+- **Volume**: 3,5x rata-rata
+- **Skor Gabungan**: 0.72
 
-#### Get Signal Statistics
-```bash
-GET /api/signals/stats?lookback=1440  # 24 jam
-```
+👉 *Tindakan*: Dikategorikan sebagai **SWING TRADE**. Tidak ditutup otomatis pukul 16:00, dengan target profit yang jauh di awang (+15% / +30%).
 
-Response akan menunjukkan:
-```json
-{
-  "total_signals": 10,
-  "by_decision": {"BUY": 3, "WAIT": 5, "NO_TRADE": 2},
-  "by_outcome_status": {"OPEN": 2, "SKIPPED": 8},
-  "truly_pending": 0
-}
-```
+### Kasus 2: Penolakan Menjadi Day Trade Saja
+Sebuah sinyal memicu pembelian saham `GOTO`:
+- **Keyakinan**: 0.58
+- **Posisi Harga**: 2% di atas VWAP
+- **Volume**: 2,1x rata-rata
+- **Skor Gabungan**: 0.45 (Tidak lolos batas 0.65)
 
-#### Get Open Positions
-```bash
-GET /api/positions/open
-```
+👉 *Tindakan*: Akan diperlakukan murni sebagai **DAY TRADE**. Batas *cut-loss* pendek (-1,5%) dan *Take Profit* kecil (+3%). Posisi akan dijual paksa pukul 16:00 WIB untuk mencegah risiko esok harinya.
 
-### Log Indicators
+---
 
-Swing trade terdeteksi:
-```
-📈 SWING TRADE detected for signal 123 (BBCA): score=0.72, Strong swing candidate
-```
+## 🎯 Kapan Sebaiknya Menggunakan Mode Ini?
 
-Swing exit levels:
-```
-📊 SWING Exit levels for BBCA @ 7250: 
-  SL=-8.0% (6670), TP1=+15.0% (8338), TP2=+30.0% (9425), ATR=145.50 [SWING MODE]
-```
+**Sangat Bagus Untuk:**
+- Saham dengan kapitalisasi besar (Bluechips) yang sedang merangkak stabil.
+- Kondisi Anda yang tidak bisa menatap layar monitor (*pantau intraday*) terus menerus.
+- Sinyal yang disertai formasi mingguan (*weekly chart*) kuat.
 
-Swing max holding reached:
-```
-📅 Swing max holding reached for BBCA: 30 days, P/L +12.5%
-```
-
-## Risk Management
-
-### Position Sizing
-- **Day Trade**: Tidak ada limit khusus (fokus pada setup)
-- **Swing Trade**: Max 5% portfolio per posisi (configurable)
-
-### Stop Loss
-- **Day Trade**: Ketat (1.5x ATR) untuk proteksi cepat
-- **Swing Trade**: Longgar (4.5x daily ATR) untuk toleransi volatility
-
-### Drawdown Protection
-- Daily loss limit tetap berlaku (default 5%)
-- Circuit breaker setelah 3 consecutive losses
-
-## Use Cases
-
-### Kapan Menggunakan Swing Trading?
-
-**Cocok untuk:**
-1. **Saham trend kuat** dengan fundamental bagus
-2. **Breakout** dengan volume tinggi di weekly chart
-3. **Sinyal confidence tinggi** (>0.75) dengan trend alignment
-4. **Tidak bisa monitoring intraday** (hold overnight)
-
-**Tidak cocok untuk:**
-1. **Saham volatile** dengan gap risk tinggi
-2. **Earnings season** (avoid overnight risk)
-3. **Low liquidity stocks** (slippage risk)
-4. **Market uncertainty** (geopolitical events)
-
-### Contoh Skenario
-
-**Scenario 1: Strong Trend Continuation**
-```
-Signal: BBCA BUY
-Confidence: 0.82
-Price: 7500 (8% above VWAP)
-Volume: 3.5x average
-Baseline: 450 samples (22 hari)
-Trend Score: 0.72
-
-→ Qualifies as SWING TRADE
-→ Exit: SL 6670 (-11%), TP1 8625 (+15%), TP2 9750 (+30%)
-→ Hold: Max 30 hari
-```
-
-**Scenario 2: Day Trade Only**
-```
-Signal: BBRI BUY  
-Confidence: 0.58
-Price: 4200 (2% above VWAP)
-Volume: 2.1x average
-Baseline: 180 samples (9 hari)
-Trend Score: 0.45
-
-→ Does NOT qualify for swing
-→ Treated as DAY TRADE
-→ Exit: SL 4137 (-1.5%), TP1 4326 (+3%), TP2 4452 (+6%)
-→ Hold: Max 4 jam, close 16:00
-```
-
-## Debugging
-
-### Cek Kenapa Sinyal Bukan Swing
-
-Tambahkan logging:
-```go
-isSwing, swingScore, reason := filterService.IsSwingSignal(signal)
-log.Printf("Swing check: %v, score=%.2f, reason=%s", isSwing, swingScore, reason)
-```
-
-### Common Issues
-
-**Issue**: Semua sinyal di-skip sebagai swing
-**Cause**: `SWING_MIN_CONFIDENCE` terlalu tinggi atau data baseline tidak cukup
-**Fix**: Turunkan threshold atau tunggu lebih banyak data historis
-
-**Issue**: Swing trades tidak hold overnight
-**Cause**: Logic error di isSwingTrade atau EnableSwingTrading=false
-**Fix**: Cek konfigurasi dan log swing detection
-
-## Performance Tracking
-
-Swing trades dapat dianalisis secara terpisah:
-
-```sql
--- Swing vs Day trade performance
-SELECT 
-  CASE 
-    WHEN so.holding_period_minutes > 240 THEN 'SWING'
-    ELSE 'DAY'
-  END as trade_type,
-  COUNT(*) as total,
-  AVG(so.profit_loss_pct) as avg_pnl,
-  SUM(CASE WHEN so.outcome_status = 'WIN' THEN 1 ELSE 0 END) as wins
-FROM signal_outcomes so
-WHERE so.outcome_status IN ('WIN', 'LOSS')
-GROUP BY trade_type;
-```
-
-## Future Enhancements
-
-1. **Pyramiding**: Tambah posisi saat trend berlanjut
-2. **Partial Exit**: Keluar 50% di TP1, hold 50% ke TP2
-3. **Trailing Stop ATR**: Adjust trailing stop berdasarkan volatility
-4. **Multi-timeframe Analysis**: Konfirmasi daily + weekly trend
-5. **Fundamental Filter**: Filter berdasarkan earnings, dividend, etc.
-
-## Summary
-
-Swing trading memberikan:
-- ✅ Lebih besar profit potential (15-30% vs 3-6%)
-- ✅ Tidak perlu monitoring intraday
-- ✅ Ride strong trends
-- ⚠️ Higher overnight risk
-- ⚠️ Longer capital tie-up
-- ⚠️ Stricter entry criteria
-
-**Gunakan swing trading hanya untuk sinyal berkualitas tinggi dengan trend yang jelas!**
+**Sangat Buruk Untuk:**
+- Saham gorengan dengan likuiditas rendah (Risiko tergelincir atau *slippage* parah saat buka pasar).
+- Musim rilis laporan keuangan yang bisa memutarbalikkan nasib saham keesokan paginya (*Earnings Gap*).
+- Indeks Harga Saham Gabungan (IHSG) sedang panik/Bearish. *(IHSG Safety Gate dari Python Screener biasanya akan mematikan ini secara otomatis)*.

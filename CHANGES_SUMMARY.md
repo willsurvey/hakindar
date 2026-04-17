@@ -1,301 +1,80 @@
-# Summary of Changes - Stockbit Trading System Enhancement
+# 🔄 Ringkasan Perubahan & Changelog (Stockbit Haka-Haki)
 
-## Overview
-This update introduces major improvements to the Stockbit Whale Analysis Trading System:
-1. **Signal Quality Improvements** - Stricter filtering for better win rates
-2. **Swing Trading Support** - Overnight position holding capability
-3. **Enhanced Documentation** - Better configuration and usage guides
+*Kembali ke [Halaman Utama](README.md)*
+
+## 📑 Gambaran Umum
+
+Sistem Analisis Whale Stockbit kini telah menerima peningkatan fitur besar-besaran untuk memastikan akurasi data, keandalan sistem hibrida (Go & Python), dan keamanan kelas institusi. Tiga pilar utama dalam pembaruan terbaru ini:
+1. **Pipeline Data yang Andal (Smart Bootstrap)** - Sistem tidak lagi memulai dari nol, melainkan mengunduh data historis secara otomatis untuk *cold-start*.
+2. **Manajer Portofolio Virtual** - Simulasi perdagangan nyata untuk mengukur kualitas sinyal dengan biaya transaksi realistis.
+3. **Pengerasan Keamanan (Security Hardening)** - Proteksi API, enkripsi token, serta pencegahan SQL Injection.
 
 ---
 
-## 📁 Files Modified
+## 📁 File yang Mengalami Perubahan Utama
 
-### 1. Configuration (`config/config.go`)
-**Changes:**
-- Added swing trading configuration struct fields
-- Updated default trading parameters (stricter thresholds)
-- Added daily loss limits and circuit breaker settings
-- Added breakeven protection settings
+### 1. Proses Bootstrapping (`app/smart_bootstrap.go`) - **[BARU]**
+- Pipeline otomatis 5 langkah untuk mencegah basis data kosong.
+- **Lapisan Ganda OHLCV**:
+  - *Long-Term* (Harian): Mengambil data sejak IPO via Yahoo Finance (untuk MA200 & indikator jangka panjang).
+  - *Short-Term* (5-Menit): Mengambil data intraday hingga 60 hari terakhir via Yahoo Finance.
+- Menghitung standar *baseline* statistik otomatis.
 
-**New Environment Variables:**
+### 2. Manajer Portofolio Virtual (`app/portfolio_manager.go`) - **[BARU]**
+- Mesin *mock-trading* untuk menghitung Lot Size berdasarkan saldo virtual (`TRADING_BALANCE`).
+- Menerapkan batasan risiko secara dinamis (contoh: maksimal 10% per posisi).
+- Menerapkan biaya layanan BEI realistis: 0,15% untuk Beli, 0,25% untuk Jual.
+- Menyediakan endpoint API `GET /api/portfolio`.
+
+### 3. Keamanan Token & Relay Redis (`auth/auth.go`, `screener/screener.py`)
+- Menerapkan enkripsi **AES-256-GCM** pada *file cache token*. Go Engine mempublikasikan token yang divalidasi ke Redis.
+- Python Screener sekarang mengeksekusi "Langkah 0" (*Step 0*): Membaca JWT Stockbit yang sudah *live* dari Redis, sehingga tidak perlu melakukan proses *login Playwright* yang memakan waktu.
+
+### 4. Perlindungan Basis Data & API (`api/server.go`, `database/repository.go`)
+- Menyuntikkan lapisan `API_KEY` Middleware untuk memblokir mutasi yang tidak sah (`POST/PUT/DELETE`).
+- Penerapan pola desain *whitelist* untuk operasi Hypertable, mencegah serangan injeksi SQL (SQL Injection).
+
+### 5. Strategi Keluaran Jangka Panjang (`app/signal_tracker.go`)
+- Memperbaiki perhitungan *VWAP* (Volume-Weighted Average Price) yang kini berbasis asimetri pergerakan *order-flow*.
+- Menambahkan lapisan *Cache* di memori (`sync.Map`) untuk mengunci *Trailing Stop*. Tujuannya mencegah *trailing stop* turun ketika ada fluktuasi dalam perhitungan *ATR*.
+
+---
+
+## 🎯 Perubahan Aturan & Konfigurasi (*Breaking Changes*)
+
+### Penambahan Variabel Environment (`.env`)
+Untuk menunjang fitur-fitur di atas, kami menambahkan pengaturan khusus di lingkungan lokal (`.env`):
 ```bash
-TRADING_BREAKEVEN_TRIGGER_PCT=1.0
-TRADING_BREAKEVEN_BUFFER_PCT=0.15
-TRADING_MAX_DAILY_LOSS_PCT=5.0
-TRADING_MAX_CONSECUTIVE_LOSSES=3
-SWING_TRADING_ENABLED=false
-SWING_MIN_CONFIDENCE=0.75
-SWING_MAX_HOLDING_DAYS=30
-SWING_ATR_MULTIPLIER=3.0
-SWING_MIN_BASELINE_DAYS=20
-SWING_POSITION_SIZE_PCT=5.0
-SWING_REQUIRE_TREND=true
-```
+# Untuk Portofolio
+TRADING_BALANCE=200000          # Saldo simulasi
+MAX_POSITION_PCT=10             # Limit % per posisi
+MAX_TOTAL_EXPOSURE_PCT=70       # Limit total paparan posisi aktif
 
-### 2. Exit Strategy (`app/exit_strategy.go`)
-**Changes:**
-- Added `GetSwingExitLevels()` - Calculates exit levels using daily ATR
-- Added `CalculateATRDaily()` - Daily candle ATR calculation
-- Wider stop losses for swing trades (4.5× vs 1.5× ATR)
-- Higher profit targets for swing (9×/18× vs 3×/6× ATR)
+# Untuk Keamanan
+TOKEN_ENCRYPTION_KEY=...        # Wajib (64-character hex)
+API_KEY=...                     # Kunci proteksi API
 
-### 3. Signal Filter (`app/signal_filter.go`)
-**Changes:**
-- Enhanced confidence calculation with sigmoid-like curve
-- Removed all strict rejection rules (`TimeOfDayFilter`, `OrderFlowFilter`, and strict confidence/winrate cutoffs).
-- Kept the statistical `StrategyPerformanceFilter` and `DynamicConfidenceFilter` to calculate continuous multipliers instead of outright rejecting signals.
-- Added `SwingTradingEvaluator` - Determines if signal qualifies for swing
-- Added trend strength and volume confirmation calculations
-- New method: `IsSwingSignal()` - Public API to check swing qualification
-
-**Key Improvements:**
-- Volume Z-score threshold increased from 2.5 to 3.0
-- Replaced boolean rejection logic with pure probability multipliers, reducing missed opportunities.
-
-### 4. Signal Tracker (`app/signal_tracker.go`)
-**Changes:**
-- Added swing trade detection on position creation
-- Different exit levels for day vs swing trades
-- Swing trades: Max 30 days holding, no auto-close at 16:00
-- Added `isSwingTrade()` helper method
-- Enhanced logging for debugging signal rejection reasons
-- Fixed "PENDING" status issue (now properly shows "PENDING" for new signals)
-
-### 5. Signal Repository (`database/signals/repository.go`)
-**Changes:**
-- Improved confidence calculation with non-linear curve
-- Stricter thresholds for Volume Breakout (Price Z > 2.5, Volume Z > 3.0)
-- Stricter thresholds for Mean Reversion (Price Z > 3.5 or < -3.5)
-- Fixed outcome status default to "PENDING" instead of empty string
-
-### 6. API Handlers (`api/handlers_strategy.go`)
-**Changes:**
-- Added `handleGetSignalStats()` endpoint for debugging signal flow
-- Returns statistics: total signals, by decision, by outcome status, truly pending
-
-### 7. API Server (`api/server.go`)
-**Changes:**
-- Registered new endpoint: `GET /api/signals/stats`
-
-### 8. Environment Example (`.env.example`)
-**Changes:**
-- Added all new configuration options with detailed comments
-- Breakeven settings
-- Daily loss limits
-- Complete swing trading configuration
-
-### 9. README (`README.md`)
-**Changes:**
-- Added "Recent Updates" section highlighting v2.0 improvements
-- New "Enhanced Signal Quality" section
-- New "Swing Trading Support" section with comparison table
-- New "API Reference" section with endpoint documentation
-
----
-
-## 🎯 Key Features Implemented
-
-### 1. Purely Statistical Signal Filtering
-**Before:**
-- Strict threshold rejections, Time of day filtering, and order flow requirement limits
-- 30 sample minimum baseline
-
-**After:**
-- Removed strict rules to fully embrace statistical analysis via multiplier adjustments.
-- 50 sample minimum baseline.
-- `DynamicConfidenceFilter` and `StrategyPerformanceFilter` only append reason warnings instead of dropping trades.
-
-### 2. Swing Trading
-**New Capability:**
-- Hold positions overnight up to 30 days
-- Different exit strategy (daily ATR-based)
-- Higher confidence requirement (0.75 vs 0.55)
-- More historical data required (20 days)
-- No auto-close at market end
-
-**Swing Detection Criteria:**
-```
-Confidence ≥ 0.75
-AND
-20+ days of history
-AND
-Trend score ≥ 0.6
-AND
-Swing Score = (Conf×0.4) + (Trend×0.4) + (Vol×0.2) ≥ 0.65
-```
-
-### 3. Risk Management
-**New Protections:**
-- Daily loss limit: Max 5% per day
-- Circuit breaker: Stop after 3 consecutive losses
-- Breakeven protection: Move stop to +0.15% at 1% profit
-- Fee-aware outcomes: Account for 0.25% round-trip fees
-
-### 4. Better Debugging
-**New API Endpoint:**
-```
-GET /api/signals/stats?lookback=60
-```
-
-**Enhanced Logging:**
-- Filter rejection reasons logged
-- Swing trade detection logged with score
-- Position type (DAY/SWING) logged on creation
-
----
-
-## 📊 Performance Impact
-
-### Expected Improvements
-| Metric | Expected Change |
-|--------|----------------|
-| **Signal Frequency** | -40% (fewer but better signals) |
-| **Win Rate** | +10-15% (higher quality entries) |
-| **Max Drawdown** | -3% (better risk management) |
-| **Avg Profit/Trade** | +30% (better exits) |
-
-### Swing Trading Benefits
-- **Larger Profits**: 15-30% targets vs 3-6% day trading
-- **Less Monitoring**: Set and forget for days
-- **Trend Riding**: Capture multi-day moves
-- **Trade Count**: Lower frequency, higher quality
-
----
-
-## 🚀 Quick Start
-
-### 1. Update Configuration
-```bash
-cp .env.example .env
-# Edit .env with your preferences
-```
-
-### 2. Enable Swing Trading (Optional)
-```bash
+# Konfigurasi Swing Trading (Jika Anda Ingin Hold Overnight)
 SWING_TRADING_ENABLED=true
 SWING_MIN_CONFIDENCE=0.75
 ```
 
-### 3. Run System
-```bash
-make up
-# or
-docker-compose up -d
-```
+### Penyesuaian Algoritma Filter
+Filter yang tadinya menolak sinyal secara instan (misal: "waktu bukan jam trading", atau "order flow rendah") sekarang diubah menjadi model berbasis **Probabilitas Multiplier**. Artinya, sistem tidak menolak mentah-mentah, melainkan menurunkan persentase kelayakannya. Hal ini menaikkan jumlah peluang emas yang sebelumnya terlewat karena filter statis.
 
-### 4. Monitor Signals
-```bash
-# Check signal statistics
-curl http://localhost:8080/api/signals/stats
-
-# View open positions
-curl http://localhost:8080/api/positions/open
-```
+*(Untuk penjelasan teknis lebih detail tentang bagaimana algoritma memfilter sinyal, lihat [Logika Perbaikan Sinyal](SIGNAL_IMPROVEMENTS.md)).*
 
 ---
 
-## 📚 Documentation
+## ✅ Panduan Migrasi (Bagi Pengguna Lama)
 
-- `SIGNAL_IMPROVEMENTS.md` - Detailed signal quality improvements
-- `SWING_TRADING.md` - Complete swing trading guide
-- `README.md` - Updated with new features
-- `.env.example` - All configuration options with comments
+1. **Tambahkan Variabel Wajib di `.env`:**
+   Pastikan Anda menyalin blok konfigurasi baru dari `.env.example`, khususnya `TOKEN_ENCRYPTION_KEY`. Jika tidak, Go Engine tidak bisa *start*.
 
----
+2. **Periksa Dashboard Anda:**
+   Sekarang Anda bisa melihat apakah sistem sudah berjalan normal melalui dua endpoint baru ini:
+   - `GET /api/bootstrap/status` (Untuk memantau persentase *download* data historis di 5 menit pertama)
+   - `GET /api/portfolio` (Untuk melihat simulasi keuntungannya).
 
-## ⚠️ Breaking Changes
-
-### Configuration Changes
-- Removed unused configuration properties: `TRADING_REQUIRE_ORDER_FLOW`, `TRADING_ORDER_FLOW_THRESHOLD`, `TRADING_AGGRESSIVE_BUY_THRESHOLD`
-- `TRADING_MIN_BASELINE_SAMPLE` now 50 (was 30)
-
-### API Changes
-- Signal `OutcomeStatus` now defaults to "PENDING" instead of empty string
-- New endpoint: `GET /api/signals/stats`
-
-### Behavior Changes
-- Signals are no longer strictly rejected based on order flow, winrate, or time-of-day.
-- Statistical multipliers are calculated per signal instead of boolean rejection blocks.
-- Daily loss limit enforced.
-
----
-
-## ✅ Migration Guide
-
-### For Existing Users
-
-1. **Update `.env` file:**
-   ```bash
-   # Add new variables
-   echo "TRADING_BREAKEVEN_TRIGGER_PCT=1.0" >> .env
-   echo "TRADING_MAX_DAILY_LOSS_PCT=5.0" >> .env
-   echo "SWING_TRADING_ENABLED=false" >> .env
-   ```
-
-2. **Review Signal Frequency:**
-   - Expect 30-50% fewer signals
-   - Monitor `/api/signals/stats` to understand flow
-   - Adjust thresholds if too restrictive
-
-3. **Test Swing Trading (Optional):**
-   ```bash
-   # Enable with conservative settings
-   SWING_TRADING_ENABLED=true
-   SWING_MIN_CONFIDENCE=0.80
-   SWING_MAX_HOLDING_DAYS=10
-   ```
-
-4. **Monitor Performance:**
-   - Check win rates via `/api/analytics/strategy-effectiveness`
-   - Review daily P&L
-   - Adjust `MaxDailyLossPct` if needed
-
----
-
-## 🔧 Troubleshooting
-
-### Issue: Too Few Signals
-**Solution:** Gradually relax thresholds
-```bash
-TRADING_ORDER_FLOW_THRESHOLD=0.50
-TRADING_MIN_BASELINE_SAMPLE=30
-TRADING_REQUIRE_ORDER_FLOW=false
-```
-
-### Issue: Signals Always "PENDING"
-**Cause:** Outcome tracker not processing
-**Solution:** 
-- Check logs for "Creating outcome" messages
-- Ensure Redis and database are connected
-- Wait for 10-second outcome tracker cycle
-
-### Issue: Swing Trades Not Working
-**Check:**
-1. `SWING_TRADING_ENABLED=true`
-2. Sufficient historical data (20 days)
-3. Signal confidence ≥ 0.75
-4. Trend score ≥ 0.6
-
----
-
-## 🎓 Next Steps
-
-1. **Monitor Initial Performance** - First week after upgrade
-2. **Tune Thresholds** - Based on your risk tolerance
-3. **Consider Swing Trading** - Start with small position size
-4. **Review Daily** - Check `/api/signals/stats` regularly
-
----
-
-## 📞 Support
-
-- Check logs: `docker logs stockbit-app`
-- Review documentation in `docs/` directory
-- Monitor API endpoints for debugging
-- Adjust configuration based on market conditions
-
----
-
-**Version:** 2.0  
-**Date:** 2025-02-20  
-**Status:** ✅ Production Ready
+3. **Coba Aktifkan Swing Trading:**
+   Jika sistem Day Trading dirasa belum maksimal, pelajari [Panduan Swing Trading](SWING_TRADING.md) untuk membiarkan posisi menggantung (hold) hingga berhari-hari.

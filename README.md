@@ -1,136 +1,121 @@
-# 📈 Stockbit Haka-Haki: Go + Python Automated Trading Pipeline
+# 📈 Stockbit Haka-Haki: Pipeline Trading Otomatis Go + Python
 
-A robust, hybrid Go & Python automated trading pipeline and signal generation engine for the Indonesian Stock Exchange (IDX) using Stockbit and Yahoo Finance data.
+Sistem pipeline trading otomatis dan pembuat sinyal hibrida (Go & Python) yang tangguh untuk Bursa Efek Indonesia (BEI) menggunakan data dari Stockbit dan Yahoo Finance.
 
-## 🌟 Architectural Highlights
+## 🌟 Sorotan Arsitektur
 
-This project adopts a microservice-oriented hybrid architecture for speed, reliability, and security:
-- **Go Engine (`/app`)**: Handles high-performance tasks including real-time WebSocket data streaming, Signal Generation, Risk Management, Virtual Portfolio tracking, and LLM Analysis integration. Uses TimescaleDB for hyperfast tick/candle storage.
-- **Python Screener (`/screener`)**: Scrapes the market, identifies top liquid movers, calculates advanced technicals (like VWAP from order-flow imbalances), and evaluates the composite index (IHSG).
-- **Redis Sync**: Acts as the nervous system. The Go engine relays its active Stockbit JWT Token to Redis, which the Python screener consumes (preventing duplicate logins). The screener relays its market insights (IHSG Safety Gate, Top Watchlist) back to the Go engine in real-time.
+Proyek ini menggunakan arsitektur hibrida berbasis layanan mikro (*microservice*) demi kecepatan, keandalan, dan keamanan:
+- **Go Engine (`/app`)**: Menangani tugas berkinerja tinggi seperti streaming data WebSocket *real-time*, Pembuatan Sinyal, Manajemen Risiko, Pelacakan Portofolio Virtual, dan Integrasi Analisis AI/LLM. Menggunakan TimescaleDB untuk penyimpanan tick/candle yang sangat cepat.
+- **Python Screener (`/screener`)**: Melakukan scraping pasar, mencari saham likuid teratas, menghitung indikator teknikal lanjutan (seperti VWAP dari ketidakseimbangan pesanan *order-flow*), dan mengevaluasi sentimen indeks harga saham gabungan (IHSG).
+- **Redis Sync**: Berperan sebagai sistem saraf penghubung. Go engine mengirimkan JWT Token Stockbit-nya ke Redis agar bisa dipakai oleh Python screener (mencegah login ganda). Screener juga mengirimkan insight pasar (IHSG Safety Gate, Top Watchlist) kembali ke Go engine secara seketika (*real-time*).
 
-## ✨ Core Features
+## ✨ Fitur Utama
 
-### 🚀 Smart Bootstrap (Cold-Start Auto-Healing)
-If the database is empty, the system automatically runs a 5-step bootstrapping process without manual intervention:
-1. Fetch today's liquid stocks via Python Screener.
-2. Fetch **Long-Term Daily Data** (from IPO to present via Yahoo Finance) for MA200 and long-term trend lines.
-3. Fetch **Short-Term 5-min Data** (up to 60 days via Yahoo Finance) for Z-Score and Intraday Whale Detection.
-4. Calculate statistical baselines (VWAP, ATR, Mean Volume).
-5. Run Whale Retrospective to analyze institutional activity prior to today.
+### 🚀 Smart Bootstrap (Pemanasan Data Otomatis)
+Jika database kosong saat sistem dijalankan, sistem akan otomatis melakukan 5 langkah *bootstrapping* tanpa intervensi manual:
+1. Menarik saham likuid hari ini via Python Screener.
+2. Menarik **Data Harian Jangka Panjang** (dari IPO hingga hari ini via Yahoo Finance) untuk MA200 dan garis tren jangka panjang.
+3. Menarik **Data 5-Menit Jangka Pendek** (hingga 60 hari via Yahoo Finance) untuk Z-Score dan Deteksi Whale Intraday.
+4. Menghitung standar statistik dasar (*baselines*) seperti VWAP, ATR, dan Volume Rata-rata.
+5. Menjalankan Retrospeksi Whale untuk menganalisis aktivitas institusi sebelum hari ini.
 
-### 💰 Virtual Portfolio Manager
-An integrated mock-trading engine to track signal quality realistically:
-- Simulates a configurable balance (Default: Rp 200,000).
-- Determines **Position Sizing** dynamically (Max 10% per position, max 70% total exposure).
-- Calculates exact Lot Sizes (1 lot = 100 shares).
-- Applies **Realistic IDX Fees** (0.15% Buy, 0.25% Sell including tax).
-- Offers a clear snapshot of Realized P/L and Win Rate via `GET /api/portfolio`.
+### 💰 Manajer Portofolio Virtual
+Mesin *mock-trading* terintegrasi untuk melacak kualitas sinyal secara realistis:
+- Mensimulasikan saldo virtual (Default: Rp 200.000).
+- Menentukan **Ukuran Posisi** (Lot Sizing) secara dinamis (Maksimal 10% per posisi, maksimal 70% total eksposur dari saldo).
+- Menerapkan **Biaya Transaksi BEI Realistis** (0,15% Beli, 0,25% Jual termasuk pajak).
+- Memberikan ringkasan Win Rate dan Profit/Loss (P/L) melalui `GET /api/portfolio`.
 
-### 🛡️ Institutional-Grade Security & Safety Gates
-- **Encrypted Token Management**: Stockbit JWT tokens are stored using AES-256-GCM encryption.
-- **Market Safety Gate**: The Python screener continuously evaluates the IHSG composite index. If the market is crashing, the Go engine halts all buying (Safety Gate), ignoring bullish signals until the market stabilizes.
-- **Dynamic Position Limit via Market Regime**: 
-  - `BULLISH`: 100% of max allowed position size.
-  - `NEUTRAL`: 70% of max allowed position size.
-  - `BEARISH`: 40% of max allowed position size.
+### 🛡️ Keamanan & Gerbang Keselamatan Kelas Institusi
+- **Manajemen Token Terenkripsi**: Token JWT Stockbit disimpan menggunakan enkripsi AES-256-GCM.
+- **Gerbang Keselamatan Pasar (Safety Gate)**: Python screener terus mengevaluasi indeks komposit IHSG. Jika pasar sedang jatuh (crash), Go engine menghentikan semua sinyal `BUY` sampai pasar stabil.
+- **Batas Posisi Dinamis (Market Regime)**: 
+  - `BULLISH`: 100% dari batas maksimal posisi.
+  - `NEUTRAL`: 70% dari batas maksimal posisi.
+  - `BEARISH`: 40% dari batas maksimal posisi.
 
-### 🎯 Exit Levels & Drift Protection
-- Protects trailing stops using in-memory `sync.Map` cache. Ensures that stop losses are ratcheted upwards but never downwards during volatile recalculations.
-
-## 🛠️ Tech Stack
-- **Go 1.21+**: Concurrency, Websockets, API, Database Management.
-- **Python 3.10+**: Playwright scraping, Pandas/Numpy heavy calculations.
-- **TimescaleDB / PostgreSQL**: Time-series optimized hyper-tables.
-- **Redis**: Token relay, message brokering, watchlist synchronization, and caching.
-- **Docker Compose**: Entire stack is containerized.
+### 🎯 Perlindungan *Drift* pada Stop Loss
+- Melindungi *trailing stop* menggunakan *cache* `sync.Map` di memori. Memastikan bahwa batas kerugian (stop loss) hanya bisa naik menyesuaikan keuntungan, dan tidak pernah turun akibat fluktuasi kalkulasi saat pasar volatil.
 
 ---
 
-## 🚀 Quick Start & Setup Instructions
+## 📚 Indeks Dokumentasi
 
-### 1. Requirements
-Ensure you have the following installed:
+Untuk menjaga kesinambungan, silakan baca dokumentasi pendukung berikut sesuai dengan kebutuhan Anda:
+
+1. 📖 **[Ringkasan Perubahan (CHANGELOG)](CHANGES_SUMMARY.md)** — Sejarah update fitur (Sesi 1, 2, 3), perubahan variabel *environment*, dan panduan migrasi.
+2. 📖 **[Penjelasan Logika & Filter Sinyal](SIGNAL_IMPROVEMENTS.md)** — Penjelasan mendalam tentang bagaimana sinyal dibuat, mekanisme *Risk Management*, dan aturan *Exit Strategy* (Breakeven & Time-Decay).
+3. 📖 **[Panduan Swing Trading](SWING_TRADING.md)** — Cara mengaktifkan mode hold overnight (sampai 30 hari) dan bedanya dengan Day Trading.
+4. 📖 **[Dokumentasi Python Screener](screener/README.md)** — Penjelasan khusus tentang sub-sistem Python yang menganalisis IHSG dan mensuplai data watchlist.
+
+---
+
+## 🚀 Panduan Setup & Menjalankan Cepat
+
+### 1. Persyaratan
+Pastikan Anda memiliki:
 - Docker & Docker Compose
-- Make (optional, but recommended for shortcuts)
-- Go 1.21+ (if running locally without docker)
-- Python 3.10+ (if running screener locally)
+- Make (opsional, tapi disarankan)
+- Go 1.21+ (jika menjalankan lokal tanpa docker)
+- Python 3.10+ (jika menjalankan screener lokal)
 
-### 2. Environment Variables Configuration
-Clone the repository and copy the example environment files:
+### 2. Konfigurasi Environment Variables
+Salin file *environment* contoh dan isi nilainya:
 
 ```bash
 cp .env.example .env
 cp screener/.env.screener.example screener/.env.screener
 ```
 
-**Key configurations in `.env`:**
+**Konfigurasi Kunci di `.env`:**
 ```ini
-# Stockbit Credentials
-STOCKBIT_USERNAME=your_username
-STOCKBIT_PASSWORD=your_password
-STOCKBIT_PLAYER_ID=your_player_id
+# Keamanan (WAJIB DIISI!) - Masukkan 64 karakter hex string acak (32 bytes)
+TOKEN_ENCRYPTION_KEY=MASUKKAN_64_KARAKTER_HEX_ANDA_DISINI
 
-# Security (MUST BE SET!) - Provide a 64 character hex string (32 bytes)
-TOKEN_ENCRYPTION_KEY=YOUR_64_CHAR_HEX_STRING_HERE
+# Keamanan API (Otorisasi Endpoint)
+API_KEY=KUNCI_RAHASIA_API_ANDA
 
-# API Security
-API_KEY=YOUR_SECRET_API_KEY_FOR_SECURE_ENDPOINTS
+# Kredensial Stockbit
+STOCKBIT_USERNAME=username_anda
+STOCKBIT_PASSWORD=password_anda
+STOCKBIT_PLAYER_ID=player_id_anda
 
-# Virtual Portfolio
-TRADING_BALANCE=200000          # Initial mock balance (Rp)
-MAX_POSITION_PCT=10             # Max % per position
-MAX_TOTAL_EXPOSURE_PCT=70       # Max total exposure of your balance
-MOCK_TRADING_MODE=true          # Keep true for simulated trades
+# Portofolio Virtual
+TRADING_BALANCE=200000          # Saldo awal simulasi (Rp)
+MAX_POSITION_PCT=10             # Maksimal % per posisi
+MAX_TOTAL_EXPOSURE_PCT=70       # Maksimal total eksposur dari saldo
+MOCK_TRADING_MODE=true          # Tetap 'true' untuk simulasi transaksi
 ```
 
-### 3. Start the Pipeline via Docker Compose
-To boot up the database, Redis, the Go Engine, and the Python Screener simultaneously:
+### 3. Menjalankan Pipeline via Docker Compose
+Untuk menyalakan Database, Redis, Go Engine, dan Python Screener secara bersamaan:
 
 ```bash
 docker compose up -d
 ```
 
-### 4. How it Runs
-1. The **Go Engine** starts, authenticates with Stockbit, encrypts and saves its session, and publishes the JWT to Redis.
-2. The **Go Engine** triggers **Smart Bootstrap** if the `running_trades` database is empty.
-3. The **Python Screener** wakes up, grabs the valid JWT from Redis (bypassing the need to log in again), and begins analyzing IHSG and top liquid stocks.
-4. The Screener publishes the `ihsg:status` and `watchlist:top` to Redis.
-5. The **Go Engine** listens to Stockbit WebSockets, applying strict filtering against the screener's watchlist and IHSG safety gates.
-6. The **Virtual Portfolio** automatically tracks Buy/Sell signals, calculating realistic Win Rates and P&L.
+### 4. Alur Berjalannya Sistem
+1. **Go Engine** menyala, login ke Stockbit, mengenkripsi *session*, dan menyebarkan JWT Token ke Redis.
+2. **Go Engine** menjalankan **Smart Bootstrap** jika database `running_trades` kosong.
+3. **Python Screener** bangun, mengambil JWT Token yang valid dari Redis (melewati batas *login manual*), dan mulai menganalisis IHSG serta saham likuid.
+4. Screener mempublikasikan `ihsg:status` dan `watchlist:top` ke Redis.
+5. **Go Engine** mendengarkan WebSocket Stockbit, dan mulai menyaring sinyal perdagangan dengan ketat terhadap *watchlist* dan *safety gate* dari screener.
+6. **Manajer Portofolio Virtual** secara otomatis mencatat sinyal Beli/Jual, menghitung Win Rate dan P/L (Profit & Loss) yang sesungguhnya.
 
 ---
 
-## 📊 Endpoints & Monitoring
+## 📊 Endpoints API & Pemantauan
 
-You can access the built-in Go API (Default: `http://localhost:8080`) to monitor system status:
+Anda dapat mengakses API bawaan Go (Default: `http://localhost:8080`) untuk memantau status sistem:
 
-- **Portfolio Snapshot:** `GET /api/portfolio`
-- **Smart Bootstrap Status:** `GET /api/bootstrap/status`
-- **Active Open Positions:** `GET /api/positions/open`
-- **Signal History:** `GET /api/signals/history`
+- **Ringkasan Portofolio Virtual:** `GET /api/portfolio`
+- **Status Smart Bootstrap:** `GET /api/bootstrap/status`
+- **Posisi Terbuka (Open Positions):** `GET /api/positions/open`
+- **Riwayat Sinyal:** `GET /api/signals/history`
 
-For modifying endpoints (requires the API_KEY set in `.env`):
-- Include the header `X-API-Key: YOUR_API_KEY`.
+Untuk mengubah state melalui endpoint (seperti POST/PUT), pastikan Anda menyertakan header otentikasi `X-API-Key: KUNCI_RAHASIA_API_ANDA` sesuai dengan `.env`.
 
 ---
 
-## 📚 Project Structure
-
-```text
-.
-├── api/                  # REST API server & middleware (JWT, API keys)
-├── app/                  # Go Engine core: smart bootstrap, signal trackers, portfolio
-├── auth/                 # AES-GCM Token lifecycle & encryption
-├── cache/                # Redis interface
-├── config/               # ENV loading
-├── database/             # PostgreSQL / Timescale models & repositories
-├── docs/                 # Extended documentation
-├── integration/          # Redis pub/sub bridges (Watchlist Sync)
-├── realtime/             # Server-Sent Events (SSE) broker
-├── screener/             # Python Screener (Playwright, Pandas, Redis Publisher)
-└── docker-compose.yml    # Full stack orchestration
-```
-
-## 📝 License
-This project is for educational purposes only. Not for financial advice.
+## 📝 Lisensi
+Proyek ini dibuat **hanya untuk tujuan edukasi dan riset**. Bukan merupakan saran keuangan (*not financial advice*).
