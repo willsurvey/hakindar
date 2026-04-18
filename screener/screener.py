@@ -360,6 +360,107 @@ def _refresh_token_via_playwright(session_path: str) -> Optional[str]:
     return None
 
 
+def _playwright_fresh_login() -> Optional[str]:
+    """
+    Login baru (username + password) via Playwright headless.
+    Digunakan saat token Redis sudah direvoke oleh Stockbit.
+    """
+    username = os.environ.get("STOCKBIT_USERNAME", "")
+    password = os.environ.get("STOCKBIT_PASSWORD", "")
+    if not username or not password:
+        log.warning("⚠️  STOCKBIT_USERNAME/PASSWORD tidak diset — tidak bisa login baru")
+        return None
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.warning("Playwright tidak terinstall — tidak bisa login baru")
+        return None
+
+    log.info("🌐 Playwright: Login baru dengan username/password...")
+    captured = []
+
+    def on_request(req):
+        auth = req.headers.get("authorization", "")
+        if auth.startswith("Bearer ") and len(auth) > 150:
+            tok = auth[7:].strip()
+            if tok.count(".") == 2 and tok not in captured:
+                captured.append(tok)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/146.0.0.0 Safari/537.36"
+                ),
+            )
+            page = ctx.new_page()
+            page.on("request", on_request)
+
+            try:
+                page.goto("https://stockbit.com/", wait_until="networkidle", timeout=45_000)
+                page.wait_for_timeout(2000)
+
+                # Klik tombol login
+                login_btn = page.locator("text=Masuk").first
+                if login_btn.is_visible(timeout=5000):
+                    login_btn.click()
+                    page.wait_for_timeout(1000)
+
+                # Isi form login
+                page.fill("input[name='username'], input[type='text']", username)
+                page.fill("input[name='password'], input[type='password']", password)
+                page.keyboard.press("Enter")
+
+                # Tunggu redirect setelah login
+                page.wait_for_timeout(8000)
+
+                # Navigasi ke halaman saham untuk trigger API call
+                page.goto("https://stockbit.com/#/symbol/BBRI", wait_until="networkidle", timeout=45_000)
+                page.wait_for_timeout(4000)
+
+                # Simpan session baru
+                session_path = CONFIG.get("SESSION_FILE", "/app/stockbit_session.json")
+                try:
+                    updated = ctx.storage_state()
+                    with open(session_path, "w", encoding="utf-8") as f:
+                        json.dump(updated, f, indent=2)
+                    log.info(f"💾 Session baru tersimpan ke {session_path}")
+                except Exception as e:
+                    log.warning(f"Gagal simpan session: {e}")
+
+            except Exception as e:
+                log.warning(f"Error saat login Playwright: {e}")
+
+            browser.close()
+
+        if captured:
+            token = max(captured, key=len)
+            log.info(f"✅ Token baru dari login Playwright ({len(token)} karakter)")
+            # Simpan juga ke token file
+            try:
+                with open(CONFIG.get("TOKEN_FILE", "/app/stockbit_token.txt"), "w") as f:
+                    f.write(token)
+            except Exception:
+                pass
+            return token
+
+    except Exception as e:
+        log.warning(f"Playwright fresh login error: {e}")
+
+    return None
+
+
+# Flag untuk mencegah re-auth loop — hanya coba sekali per sesi screener
+_reauth_attempted = False
+
+
 def get_valid_token() -> Tuple[Optional[str], str]:
     """
     Ambil token yang valid. Return (token, mode).
@@ -372,6 +473,8 @@ def get_valid_token() -> Tuple[Optional[str], str]:
     3. Refresh via Playwright jika expired
     4. Fallback MODE B jika semua gagal
     """
+    global _reauth_attempted
+
     # --- 0. Redis token relay (from Go system) ---
     try:
         import redis as redis_lib
@@ -384,6 +487,8 @@ def get_valid_token() -> Tuple[Optional[str], str]:
         if redis_token and _is_token_valid(redis_token):
             log.info("✅ Token dari Redis (Go system relay) — FULL STOCKBIT MODE")
             return redis_token, "FULL_STOCKBIT"
+        elif redis_token:
+            log.info("⚠️  Token Redis ada tapi sudah expired — mencoba login ulang...")
     except Exception as e:
         log.debug(f"Redis token check failed (non-critical): {e}")
 
@@ -428,6 +533,15 @@ def get_valid_token() -> Tuple[Optional[str], str]:
                             return line, "FULL_STOCKBIT"
             except Exception:
                 pass
+
+    # --- 3. Login baru via Playwright sebagai last resort ---
+    if not _reauth_attempted:
+        _reauth_attempted = True
+        log.info("🔑 Mencoba login baru via Playwright...")
+        new_token = _playwright_fresh_login()
+        if new_token and _is_token_valid(new_token):
+            log.info("✅ Login baru berhasil — FULL STOCKBIT MODE")
+            return new_token, "FULL_STOCKBIT"
 
     log.warning("⚠️ Tidak ada token valid → YAHOO ONLY MODE")
     return None, "YAHOO_ONLY"
