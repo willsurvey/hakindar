@@ -127,15 +127,30 @@ func (s *Server) apiKeyMiddleware(next http.Handler) http.Handler {
 		return next // No auth in dev mode
 	}
 
+	// POST endpoints explicitly exempted from API key requirement
+	// (AI analysis is accessible from UI without requiring API key)
+	exemptedPOST := map[string]bool{
+		"/api/ai/analysis/custom":  true,
+		"/api/ai/analysis/symbol":  true,
+	}
+
 	log.Println("🔐 API key authentication enabled for POST/PUT/DELETE endpoints")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow all GET requests without auth (readonly)
+		// Allow all GET and OPTIONS requests without auth (readonly)
 		if r.Method == "GET" || r.Method == "OPTIONS" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Check X-API-Key header for mutation requests
+		// Allow explicitly exempted POST endpoints (AI analysis from UI)
+		if r.Method == "POST" {
+			if exemptedPOST[r.URL.Path] {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// Check X-API-Key header for all other mutation requests
 		reqKey := r.Header.Get("X-API-Key")
 		if reqKey == "" {
 			reqKey = r.URL.Query().Get("api_key") // Fallback: query param
