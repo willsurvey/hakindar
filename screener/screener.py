@@ -242,6 +242,7 @@ def _decode_jwt_payload(token: str) -> Optional[Dict]:
         return None
 
 
+
 def _is_token_valid(token: str) -> bool:
     """Cek apakah token belum expired (dengan buffer 5 menit)."""
     if not token or len(token) < 100:
@@ -251,6 +252,82 @@ def _is_token_valid(token: str) -> bool:
         return False
     exp = payload.get("exp", 0)
     return time.time() < (exp - 300)   # 5 menit buffer
+
+
+# Cache token API login — agar tidak login ulang setiap siklus screener
+_api_token_cache: Optional[str] = None
+_api_token_expiry: float = 0.0
+
+
+def _login_via_api() -> Optional[str]:
+    """
+    Login langsung ke Stockbit API menggunakan credentials dari env.
+    Sama persis dengan cara Go Engine login — tidak butuh Playwright.
+    Response: data.login.token_data.access.token
+    """
+    global _api_token_cache, _api_token_expiry
+
+    # Gunakan cache jika masih valid (hemat request)
+    if _api_token_cache and time.time() < _api_token_expiry:
+        return _api_token_cache
+
+    username = os.environ.get("STOCKBIT_USERNAME", "").strip()
+    password = os.environ.get("STOCKBIT_PASSWORD", "").strip()
+    player_id = os.environ.get("STOCKBIT_PLAYER_ID", "").strip()
+
+    if not username or not password:
+        log.warning("⚠️  STOCKBIT_USERNAME/PASSWORD tidak diset — tidak bisa login API")
+        return None
+
+    log.info("🔑 Login ke Stockbit API (Python direct login)...")
+
+    url = "https://exodus.stockbit.com/login/v6/username"
+    payload = {
+        "player_id": player_id,
+        "user": username,
+        "password": password,
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+        ),
+        "X-DeviceType": "Google Chrome",
+        "X-Platform": "PC",
+        "X-AppVersion": "3.17.2",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Language": "ID",
+        "Origin": "https://stockbit.com",
+        "Referer": "https://stockbit.com/",
+    }
+
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            token = (
+                data.get("data", {})
+                    .get("login", {})
+                    .get("token_data", {})
+                    .get("access", {})
+                    .get("token", "")
+            )
+            if token and _is_token_valid(token):
+                # Cache selama 23 jam (token Stockbit berlaku 24 jam)
+                _api_token_cache = token
+                _api_token_expiry = time.time() + (23 * 3600)
+                log.info(f"✅ Login API berhasil — token valid ({len(token)} karakter)")
+                return token
+            else:
+                log.warning(f"⚠️  Login API sukses tapi token tidak valid (len={len(token)})")
+                log.debug(f"Response: {r.text[:300]}")
+        else:
+            log.warning(f"⚠️  Login API gagal: HTTP {r.status_code} — {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"⚠️  Login API error: {e}")
+
+    return None
 
 
 def _extract_token_from_session(session_path: str) -> Optional[str]:
@@ -466,16 +543,24 @@ def get_valid_token() -> Tuple[Optional[str], str]:
     Ambil token yang valid. Return (token, mode).
     mode: "FULL_STOCKBIT" | "YAHOO_ONLY"
 
-    Urutan:
-    0. Baca dari Redis (dikirim oleh Go system yang sudah login)
-    1. Baca dari environment variable STOCKBIT_BEARER_TOKEN (GitHub Actions)
-    2. Baca dari stockbit_session.json (lokal)
-    3. Refresh via Playwright jika expired
-    4. Fallback MODE B jika semua gagal
+    Urutan (prioritas):
+    0. Direct API login Python (paling andal — generate token sendiri)
+    1. Redis relay dari Go Engine (jika API login gagal)
+    2. Environment variable STOCKBIT_BEARER_TOKEN (GitHub Actions)
+    3. Session file stockbit_session.json (Playwright legacy)
+    4. Playwright fresh login (last resort)
+    5. YAHOO ONLY MODE (fallback tanpa Stockbit)
     """
     global _reauth_attempted
 
-    # --- 0. Redis token relay (from Go system) ---
+    # --- 0. Direct Python API login (PRIORITAS UTAMA) ---
+    # Login langsung ke Stockbit API — tidak bergantung pada Go/Redis/Playwright
+    api_token = _login_via_api()
+    if api_token:
+        return api_token, "FULL_STOCKBIT"
+
+    # --- 1. Redis token relay (from Go system) ---
+    # Digunakan sebagai fallback jika API login gagal (misal: rate limit)
     try:
         import redis as redis_lib
         r = redis_lib.Redis(
@@ -488,17 +573,17 @@ def get_valid_token() -> Tuple[Optional[str], str]:
             log.info("✅ Token dari Redis (Go system relay) — FULL STOCKBIT MODE")
             return redis_token, "FULL_STOCKBIT"
         elif redis_token:
-            log.info("⚠️  Token Redis ada tapi sudah expired — mencoba login ulang...")
+            log.debug("Token Redis ada tapi expired — lanjut ke fallback berikutnya")
     except Exception as e:
         log.debug(f"Redis token check failed (non-critical): {e}")
 
-    # --- 1. Env var (GitHub Actions) ---
+    # --- 2. Env var (GitHub Actions / manual override) ---
     env_token = os.environ.get("STOCKBIT_BEARER_TOKEN", "").strip()
     if env_token and _is_token_valid(env_token):
         log.info("✅ Token dari environment variable — FULL STOCKBIT MODE")
         return env_token, "FULL_STOCKBIT"
 
-    # --- 2. Session file ---
+    # --- 3. Session file (Playwright legacy) ---
     session_path = CONFIG["SESSION_FILE"]
     if Path(session_path).exists():
         token = _extract_token_from_session(session_path)
@@ -506,12 +591,10 @@ def get_valid_token() -> Tuple[Optional[str], str]:
             log.info("✅ Token dari session file — FULL STOCKBIT MODE")
             return token, "FULL_STOCKBIT"
 
-        # Token ada tapi expired → coba refresh
         if token:
-            log.info("⚠️ Token expired, mencoba refresh via Playwright...")
+            log.info("⚠️ Token session expired, mencoba refresh via Playwright...")
             new_token = _refresh_token_via_playwright(session_path)
             if new_token and _is_token_valid(new_token):
-                # Simpan ke token file untuk referensi
                 try:
                     with open(CONFIG["TOKEN_FILE"], "w") as f:
                         f.write(new_token)
@@ -519,12 +602,10 @@ def get_valid_token() -> Tuple[Optional[str], str]:
                     pass
                 return new_token, "FULL_STOCKBIT"
 
-        # Playwright juga gagal → coba load dari stockbit_token.txt
         token_file = CONFIG["TOKEN_FILE"]
         if Path(token_file).exists():
             try:
                 raw = Path(token_file).read_text().strip()
-                # Ambil baris terakhir yang bukan komentar
                 for line in reversed(raw.splitlines()):
                     line = line.strip()
                     if line and not line.startswith("#"):
@@ -534,16 +615,16 @@ def get_valid_token() -> Tuple[Optional[str], str]:
             except Exception:
                 pass
 
-    # --- 3. Login baru via Playwright sebagai last resort ---
+    # --- 4. Playwright fresh login (last resort) ---
     if not _reauth_attempted:
         _reauth_attempted = True
-        log.info("🔑 Mencoba login baru via Playwright...")
+        log.info("🌐 Mencoba login baru via Playwright...")
         new_token = _playwright_fresh_login()
         if new_token and _is_token_valid(new_token):
-            log.info("✅ Login baru berhasil — FULL STOCKBIT MODE")
+            log.info("✅ Login Playwright berhasil — FULL STOCKBIT MODE")
             return new_token, "FULL_STOCKBIT"
 
-    log.warning("⚠️ Tidak ada token valid → YAHOO ONLY MODE")
+    log.warning("⚠️ Semua metode auth gagal → YAHOO ONLY MODE")
     return None, "YAHOO_ONLY"
 
 
