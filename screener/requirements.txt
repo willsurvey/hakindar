@@ -1,11 +1,3 @@
-pandas>=2.0.0
-yfinance>=0.2.30
-requests>=2.31.0
-playwright>=1.40.0
-redis>=5.0.0
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
-
 # ============================================================
 # requirements.txt — Stock Screener IDX
 # Python: 3.13
@@ -49,6 +41,8 @@ playwright==1.58.0
 pyarrow==23.0.1
 colorama==0.4.6
 openpyxl==3.1.5
+redis>=5.0.0
+lxml>=4.9.0
 
 # -------------------------------------------------------------
 # Transitive Dependencies yang Dipin (Opsional, untuk Reproducibility)
