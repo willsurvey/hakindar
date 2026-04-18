@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"stockbit-haka-haki/cache"
 	"stockbit-haka-haki/database"
 	"stockbit-haka-haki/llm"
 	"stockbit-haka-haki/notifications"
@@ -26,6 +27,7 @@ type Server struct {
 	signalTracker  SignalTrackerInterface // Use case for signal tracking
 	bootstrapProv  BootstrapProvider      // Bootstrap progress provider
 	portfolioProv  PortfolioProvider      // Virtual portfolio summary
+	redisCache     *cache.RedisClient     // Redis client untuk AI analyst context
 }
 
 // SignalTrackerInterface defines the interface for signal tracking operations
@@ -48,6 +50,11 @@ func NewServer(repo *database.TradeRepository, webhookMq *notifications.WebhookM
 		llmClient:  llmClient,
 		llmEnabled: llmEnabled,
 	}
+}
+
+// SetRedisCache sets the Redis client for AI analyst context enrichment
+func (s *Server) SetRedisCache(rc *cache.RedisClient) {
+	s.redisCache = rc
 }
 
 // SetSignalTracker sets the signal tracker use case

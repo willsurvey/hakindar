@@ -256,6 +256,80 @@ func (s *Server) handleCustomPromptStream(w http.ResponseWriter, r *http.Request
 				}
 				contextBuilder.WriteString("\n")
 			}
+
+		case "running_trade":
+			// Get running trade summary from Redis (published by screener)
+			if s.redisCache == nil {
+				log.Printf("running_trade: redisCache not configured")
+				break
+			}
+			var rt struct {
+				Timestamp    string `json:"timestamp"`
+				Date         string `json:"date"`
+				TotalSymbols int    `json:"total_symbols"`
+				Summary      map[string]struct {
+					BuyLot        int    `json:"buy_lot"`
+					SellLot       int    `json:"sell_lot"`
+					NetLot        int    `json:"net_lot"`
+					ForeignNet    int    `json:"foreign_net"`
+					DominantBuyer string `json:"dominant_buyer"`
+				} `json:"summary"`
+			}
+			if err := s.redisCache.Get(r.Context(), "stockbit:running_trade", &rt); err == nil {
+				contextBuilder.WriteString(fmt.Sprintf("=== RUNNING TRADE (%s %s) — TOP 15 AKTIF ===\n", rt.Date, rt.Timestamp))
+				contextBuilder.WriteString("Format: SIMBOL | Net Lot | Buy | Sell | Foreign Net | Broker Dominan\n")
+				count := 0
+				for sym, sv := range rt.Summary {
+					if count >= 15 {
+						break
+					}
+					foreignTag := ""
+					if sv.ForeignNet > 500 {
+						foreignTag = " 🟢ASING BELI"
+					} else if sv.ForeignNet < -500 {
+						foreignTag = " 🔴ASING JUAL"
+					}
+					contextBuilder.WriteString(fmt.Sprintf(
+						"- %-6s | net=%+d | buy=%d | sell=%d | foreign=%+d%s | broker=%s\n",
+						sym, sv.NetLot, sv.BuyLot, sv.SellLot, sv.ForeignNet, foreignTag, sv.DominantBuyer,
+					))
+					count++
+				}
+				contextBuilder.WriteString("\n")
+			} else {
+				log.Printf("running_trade: Redis get failed: %v", err)
+			}
+
+		case "keystats":
+			// Get keystats fundamental per symbol from Redis
+			if s.redisCache == nil {
+				log.Printf("keystats: redisCache not configured")
+				break
+			}
+			if len(reqBody.Symbols) > 0 {
+				contextBuilder.WriteString("=== FUNDAMENTAL KEYSTATS ===\n")
+				contextBuilder.WriteString("Format: SIMBOL | PE | ROE% | DivYield% | PBV | RevGrowth% | F-Score\n")
+				for _, sym := range reqBody.Symbols {
+					var ks map[string]interface{}
+					ksErr := s.redisCache.Get(r.Context(), fmt.Sprintf("stockbit:keystats:%s", sym), &ks)
+					if ksErr != nil {
+						contextBuilder.WriteString(fmt.Sprintf("- %s: data fundamental belum tersedia\n", sym))
+						continue
+					}
+					getF := func(key string) string {
+						if v, ok := ks[key]; ok && v != nil {
+							return fmt.Sprintf("%.2f", v)
+						}
+						return "-"
+					}
+					contextBuilder.WriteString(fmt.Sprintf(
+						"- %-6s | PE=%s | ROE=%s%% | Div=%s%% | PBV=%s | RevGrow=%s%% | F-Score=%s\n",
+						sym, getF("pe_ttm"), getF("roe_ttm"), getF("dividend_yield"),
+						getF("pbv"), getF("revenue_growth_yoy"), getF("piotroski_score"),
+					))
+				}
+				contextBuilder.WriteString("\n")
+			}
 		}
 	}
 

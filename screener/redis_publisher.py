@@ -138,6 +138,87 @@ def publish_screening_to_redis(
             pass
 
 
+def publish_running_trade(summary: Dict):
+    """
+    Publish ringkasan running trade ke Redis untuk konsumsi AI analyst Go.
+
+    Key: stockbit:running_trade
+    TTL: 1 jam
+
+    Format summary:
+    {
+      "timestamp": "16:14:51",
+      "last_trade_number": 2330610,
+      "summary": {
+        "CUAN": {"net_lot": 4403, "buy_lot": 4403, "sell_lot": 0,
+                 "dominant_buyer": "MG", "foreign_net": -614}
+      }
+    }
+    """
+    client = _get_redis_client()
+    if client is None:
+        return
+
+    try:
+        client.set(
+            "stockbit:running_trade",
+            json.dumps(summary, ensure_ascii=False),
+            ex=3600,  # TTL 1 jam
+        )
+        n = len(summary.get("summary", {}))
+        log.info(f"📡 Running trade → Redis: {n} simbol teraktif")
+    except Exception as e:
+        log.warning(f"⚠️ Running trade publish failed: {e}")
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def publish_keystats(symbol: str, keystats: Dict):
+    """
+    Publish keystats fundamental per simbol ke Redis untuk AI analyst.
+
+    Key: stockbit:keystats:{symbol}
+    TTL: 24 jam (data fundamental tidak berubah harian)
+
+    Format keystats:
+    {
+      "symbol": "BBRI",
+      "pe_ttm": 9.18,
+      "eps_ttm": 373.80,
+      "roe_ttm": 17.48,
+      "revenue_growth": 18.71,
+      "net_profit_margin": 30.18,
+      "dividend_yield": 10.09,
+      "piotroski_score": 5.0,
+      "52w_high": 4450,
+      "52w_low": 3220,
+      "price_return_ytd": -6.28
+    }
+    """
+    client = _get_redis_client()
+    if client is None:
+        return
+
+    try:
+        keystats["symbol"] = symbol
+        client.set(
+            f"stockbit:keystats:{symbol}",
+            json.dumps(keystats, ensure_ascii=False),
+            ex=86400,  # TTL 24 jam
+        )
+        log.debug(f"📡 Keystats {symbol} → Redis (PE={keystats.get('pe_ttm','?')}, ROE={keystats.get('roe_ttm','?')}%)")
+    except Exception as e:
+        log.warning(f"⚠️ Keystats publish failed for {symbol}: {e}")
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
 def publish_from_json_file(json_path: str):
     """
     Load screening output JSON file and publish to Redis.

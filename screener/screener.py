@@ -685,6 +685,178 @@ def sb_get(endpoint: str, token: str, params=None) -> Optional[Dict]:
     return None
 
 
+
+# =============================================================================
+# STOCKBIT ENRICHMENT: Running Trade & Keystats (untuk AI Analyst)
+# =============================================================================
+
+def fetch_running_trade(token: str, last_trade_number: int = 0) -> Optional[Dict]:
+    """
+    Ambil data running trade terbaru dari Stockbit.
+    Agregasi per simbol: buy_lot, sell_lot, net_lot, dominant_buyer, foreign_net.
+
+    Return: dict {timestamp, last_trade_number, summary: {symbol: {...}}}
+    Publish otomatis ke Redis (stockbit:running_trade) jika berhasil.
+    """
+    params = {
+        "sort": "DESC",
+        "limit": "200",
+        "order_by": "RUNNING_TRADE_ORDER_BY_TIME",
+    }
+    if last_trade_number > 0:
+        params["trade_number"] = str(last_trade_number)
+
+    data = sb_get("/order-trade/running-trade", token, params)
+    if not data:
+        return None
+
+    trades = data.get("data", {}).get("running_trade", [])
+    if not trades:
+        return None
+
+    # Agregasi per simbol
+    agg: Dict[str, Dict] = {}
+    last_tn = 0
+    last_time = ""
+
+    for t in trades:
+        code = t.get("code", "")
+        if not code:
+            continue
+
+        action = t.get("action", "")
+        raw_lot = t.get("lot", "0").replace(",", "")
+        try:
+            lot = int(raw_lot)
+        except ValueError:
+            lot = 0
+
+        buyer_type = t.get("buyer_type", "")
+        seller_type = t.get("seller_type", "")
+        buyer = t.get("buyer", "").split(" ")[0]  # ambil kode broker saja
+
+        tn = int(t.get("trade_number", "0") or 0)
+        if tn > last_tn:
+            last_tn = tn
+            last_time = t.get("time", "")
+
+        if code not in agg:
+            agg[code] = {
+                "buy_lot": 0, "sell_lot": 0, "net_lot": 0,
+                "foreign_net": 0, "dominant_buyer": "",
+                "buyer_counts": {},
+            }
+
+        entry = agg[code]
+        if action == "buy":
+            entry["buy_lot"] += lot
+            # Net foreign: buyer is foreign = +, seller is foreign = -
+            if buyer_type == "BROKER_TYPE_FOREIGN":
+                entry["foreign_net"] += lot
+            if seller_type == "BROKER_TYPE_FOREIGN":
+                entry["foreign_net"] -= lot
+            # Track dominant buyer broker
+            entry["buyer_counts"][buyer] = entry["buyer_counts"].get(buyer, 0) + lot
+        else:
+            entry["sell_lot"] += lot
+
+    # Hitung net_lot dan dominant_buyer
+    for code, entry in agg.items():
+        entry["net_lot"] = entry["buy_lot"] - entry["sell_lot"]
+        if entry["buyer_counts"]:
+            entry["dominant_buyer"] = max(entry["buyer_counts"], key=entry["buyer_counts"].get)
+        del entry["buyer_counts"]  # bersihkan sebelum publish
+
+    # Urutkan berdasarkan |net_lot| — yang paling aktif di atas
+    sorted_summary = dict(
+        sorted(agg.items(), key=lambda x: abs(x[1]["net_lot"]), reverse=True)
+    )
+
+    result = {
+        "timestamp": last_time,
+        "last_trade_number": last_tn,
+        "date": data.get("data", {}).get("date", ""),
+        "total_symbols": len(sorted_summary),
+        "summary": sorted_summary,
+    }
+
+    # Publish ke Redis
+    try:
+        from redis_publisher import publish_running_trade
+        publish_running_trade(result)
+    except Exception as e:
+        log.debug(f"Running trade publish skipped: {e}")
+
+    return result
+
+
+def fetch_keystats(symbol: str, token: str) -> Optional[Dict]:
+    """
+    Ambil key stats fundamental dari Stockbit untuk satu simbol.
+    Parse dan return dict ringkas untuk AI analyst context.
+    Publish ke Redis (stockbit:keystats:{symbol}) jika berhasil.
+    """
+    data = sb_get(f"/keystats/ratio/v1/{symbol}?year_limit=1", token)
+    if not data:
+        return None
+
+    items = data.get("data", {}).get("closure_fin_items_results", [])
+    if not items:
+        return None
+
+    # Map nama field ke key yang kita inginkan
+    name_map = {
+        "Current PE Ratio (TTM)":         "pe_ttm",
+        "Current EPS (TTM)":              "eps_ttm",
+        "Return on Equity (TTM)":         "roe_ttm",
+        "Return on Assets (TTM)":         "roa_ttm",
+        "Net Profit Margin (Quarter)":    "net_profit_margin",
+        "Revenue (Quarter YoY Growth)":   "revenue_growth_yoy",
+        "Net Income (Quarter YoY Growth)":"net_income_growth_yoy",
+        "Dividend Yield":                 "dividend_yield",
+        "Piotroski F-Score":              "piotroski_score",
+        "52 Week High":                   "high_52w",
+        "52 Week Low":                    "low_52w",
+        "Year to Date Price Returns":     "price_return_ytd",
+        "Debt to Equity Ratio (Quarter)": "debt_to_equity",
+        "EV to EBITDA (TTM)":             "ev_ebitda",
+        "Current Price to Book Value":    "pbv",
+    }
+
+    ks: Dict[str, Optional[float]] = {}
+    for group in items:
+        for fn in group.get("fin_name_results", []):
+            name = fn.get("fitem", {}).get("name", "")
+            raw_val = fn.get("fitem", {}).get("value", "-")
+            key = name_map.get(name)
+            if not key:
+                continue
+
+            # Parse nilai — bersihkan %, koma, tanda kurung (negatif)
+            try:
+                val_str = raw_val.replace("%", "").replace(",", "").strip()
+                if val_str in ("-", "", "N/A"):
+                    ks[key] = None
+                elif val_str.startswith("(") and val_str.endswith(")"):
+                    ks[key] = -float(val_str[1:-1].split()[0])
+                else:
+                    ks[key] = float(val_str.split()[0])
+            except (ValueError, IndexError):
+                ks[key] = None
+
+    if not ks:
+        return None
+
+    # Publish ke Redis
+    try:
+        from redis_publisher import publish_keystats as _pub_ks
+        _pub_ks(symbol, ks.copy())
+    except Exception as e:
+        log.debug(f"Keystats publish skipped for {symbol}: {e}")
+
+    return ks
+
+
 # =============================================================================
 # STEP 1: MARKET CONTEXT (IHSG)
 # =============================================================================
