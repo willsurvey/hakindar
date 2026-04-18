@@ -47,8 +47,9 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 	}
 
 	if len(alerts) == 0 {
-		http.Error(w, "No whale alerts found for this symbol", http.StatusNotFound)
-		return
+		// Tidak ada whale alert — tetap lanjut ke LLM dengan info ini
+		// LLM akan memberikan respons umum + info bahwa tidak ada aktivitas whale
+		log.Printf("ℹ️  No whale alerts found for %s, proceeding with empty context for LLM", symbol)
 	}
 
 	// Fetch enriched metadata for context
@@ -75,8 +76,18 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Generate prompt with enriched data
-	prompt := llm.FormatSymbolAnalysisPrompt(symbol, alerts, baseline, orderFlow, followups)
+	// Generate prompt with enriched data (handles empty alerts gracefully)
+	var prompt string
+	if len(alerts) == 0 {
+		prompt = fmt.Sprintf(
+			"Analisis saham %s. PERHATIAN: Tidak ada aktivitas whale alert terdeteksi dalam periode yang diminta. "+
+				"Jelaskan secara umum profil saham ini dan berikan insight tentang kondisi saat ini berdasarkan pengetahuan Anda. "+
+				"Sampaikan juga bahwa data real-time tidak tersedia saat ini.",
+			symbol,
+		)
+	} else {
+		prompt = llm.FormatSymbolAnalysisPrompt(symbol, alerts, baseline, orderFlow, followups)
+	}
 
 	// Stream LLM response
 	err = s.llmClient.AnalyzeStream(r.Context(), prompt, func(chunk string) error {
