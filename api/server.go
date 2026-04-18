@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -116,56 +115,6 @@ func (s *Server) Start(port int) error {
 	serverAddr := fmt.Sprintf("0.0.0.0:%d", port)
 	log.Printf("🚀 API Server starting on %s", serverAddr)
 	return http.ListenAndServe(serverAddr, handler)
-}
-
-// apiKeyMiddleware protects mutation endpoints (POST/PUT/DELETE) with API key auth
-// GET requests are always allowed (readonly dashboard access)
-// If API_KEY env var is not set, auth is disabled (dev mode)
-func (s *Server) apiKeyMiddleware(next http.Handler) http.Handler {
-	apiKey := os.Getenv("API_KEY")
-	if apiKey == "" {
-		log.Println("⚠️  API_KEY not set — mutation endpoints unprotected (dev mode)")
-		return next // No auth in dev mode
-	}
-
-	// POST endpoints explicitly exempted from API key requirement
-	// (AI analysis is accessible from UI without requiring API key)
-	exemptedPOST := map[string]bool{
-		"/api/ai/analysis/custom":  true,
-		"/api/ai/analysis/symbol":  true,
-	}
-
-	log.Println("🔐 API key authentication enabled for POST/PUT/DELETE endpoints")
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow all GET and OPTIONS requests without auth (readonly)
-		if r.Method == "GET" || r.Method == "OPTIONS" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Allow explicitly exempted POST endpoints (AI analysis from UI)
-		if r.Method == "POST" {
-			if exemptedPOST[r.URL.Path] {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		// Check X-API-Key header for all other mutation requests
-		reqKey := r.Header.Get("X-API-Key")
-		if reqKey == "" {
-			reqKey = r.URL.Query().Get("api_key") // Fallback: query param
-		}
-
-		if reqKey != apiKey {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error":"unauthorized","message":"valid API key required for mutation endpoints"}`))
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
 
 // Middleware
