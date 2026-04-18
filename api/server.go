@@ -109,8 +109,9 @@ func (s *Server) Start(port int) error {
 		fs.ServeHTTP(w, r)
 	})
 
-	// Add middleware (gzip -> cors -> apiKey -> logging)
-	handler := s.gzipMiddleware(s.corsMiddleware(s.apiKeyMiddleware(s.loggingMiddleware(mux))))
+	// Add middleware (gzip -> cors -> logging)
+	// API key middleware dinonaktifkan — sistem berjalan lokal
+	handler := s.gzipMiddleware(s.corsMiddleware(s.loggingMiddleware(mux)))
 
 	serverAddr := fmt.Sprintf("0.0.0.0:%d", port)
 	log.Printf("🚀 API Server starting on %s", serverAddr)
