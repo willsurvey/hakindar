@@ -210,6 +210,11 @@ func (a *App) Start() error {
 		apiServer.SetPortfolioProvider(a.portfolioManager)
 	}
 
+	// Inject Redis cache for AI analyst context enrichment (running trade, keystats)
+	if a.redis != nil {
+		apiServer.SetRedisCache(a.redis)
+	}
+
 	// Start API Server after dependencies are initialized
 	go func() {
 		if err := apiServer.Start(8080); err != nil {
