@@ -42,8 +42,9 @@ type App struct {
 	correlationAnal  *CorrelationAnalyzer  // Phase 3: Stock correlations
 	perfRefresher    *PerformanceRefresher // Phase 3: Performance view refresher
 	smartBootstrap   *SmartBootstrap       // Cold-start data seeding
-	watchlistSync    *integration.WatchlistSync // Screener ↔ Go integration
-	portfolioManager *PortfolioManager     // Virtual portfolio tracking
+	watchlistSync     *integration.WatchlistSync   // Screener ↔ Go integration
+	portfolioManager  *PortfolioManager             // Virtual portfolio tracking
+	stockbitCollector *realtime.StockbitCollector   // Periodic Stockbit API collector
 }
 
 // New creates a new application instance
@@ -182,6 +183,31 @@ func (a *App) Start() error {
 		a.watchlistSync = integration.NewWatchlistSync(a.redis)
 		go a.watchlistSync.Start(ctx)
 		log.Println("📋 Watchlist Sync started (syncing screener output from Redis)")
+	}
+
+	// 8b. Start Stockbit Go Collector (running trade + company info)
+	// Uses Go's own auth token — no Python 401 risk
+	if a.redis != nil {
+		a.stockbitCollector = realtime.NewStockbitCollector(a.authManager.GetClient(), a.redis)
+		// Feed watchlist tickers to collector so it knows which symbols to fetch company info for
+		if a.watchlistSync != nil {
+			a.stockbitCollector.SetSymbols(a.watchlistSync.GetAllWatchlistTickers())
+			// Also update symbols when watchlist refreshes (via ticker feed)
+			go func() {
+				t := time.NewTicker(5 * time.Minute)
+				defer t.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						a.stockbitCollector.SetSymbols(a.watchlistSync.GetAllWatchlistTickers())
+					}
+				}
+			}()
+		}
+		go a.stockbitCollector.Start(ctx)
+		log.Println("📡 Stockbit Collector started (running trade + company info → Redis)")
 	}
 
 	// 9. Start Phase 1 Enhancement Trackers

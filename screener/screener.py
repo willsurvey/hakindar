@@ -692,12 +692,21 @@ def sb_get(endpoint: str, token: str, params=None) -> Optional[Dict]:
 
 def fetch_running_trade(token: str, last_trade_number: int = 0) -> Optional[Dict]:
     """
-    Ambil data running trade terbaru dari Stockbit.
-    Agregasi per simbol: buy_lot, sell_lot, net_lot, dominant_buyer, foreign_net.
-
-    Return: dict {timestamp, last_trade_number, summary: {symbol: {...}}}
-    Publish otomatis ke Redis (stockbit:running_trade) jika berhasil.
+    Ambil data running trade terbaru.
+    Redis-first: Baca dari stockbit:running_trade (diisi Go setiap 3 menit).
+    Fallback: sb_get() langsung ke API + agregasi.
     """
+    # --- Try Redis first ---
+    try:
+        from redis_reader import read_running_trade
+        redis_data = read_running_trade()
+        if redis_data and redis_data.get("summary"):
+            log.info(f"  Running trade from Redis: {redis_data.get('total_symbols', 0)} symbols")
+            return redis_data
+    except Exception:
+        pass
+
+    # --- Fallback: API ---
     params = {
         "sort": "DESC",
         "limit": "200",
@@ -714,7 +723,6 @@ def fetch_running_trade(token: str, last_trade_number: int = 0) -> Optional[Dict
     if not trades:
         return None
 
-    # Agregasi per simbol
     agg: Dict[str, Dict] = {}
     last_tn = 0
     last_time = ""
@@ -733,7 +741,7 @@ def fetch_running_trade(token: str, last_trade_number: int = 0) -> Optional[Dict
 
         buyer_type = t.get("buyer_type", "")
         seller_type = t.get("seller_type", "")
-        buyer = t.get("buyer", "").split(" ")[0]  # ambil kode broker saja
+        buyer = t.get("buyer", "").split(" ")[0]
 
         tn = int(t.get("trade_number", "0") or 0)
         if tn > last_tn:
@@ -750,24 +758,20 @@ def fetch_running_trade(token: str, last_trade_number: int = 0) -> Optional[Dict
         entry = agg[code]
         if action == "buy":
             entry["buy_lot"] += lot
-            # Net foreign: buyer is foreign = +, seller is foreign = -
             if buyer_type == "BROKER_TYPE_FOREIGN":
                 entry["foreign_net"] += lot
             if seller_type == "BROKER_TYPE_FOREIGN":
                 entry["foreign_net"] -= lot
-            # Track dominant buyer broker
             entry["buyer_counts"][buyer] = entry["buyer_counts"].get(buyer, 0) + lot
         else:
             entry["sell_lot"] += lot
 
-    # Hitung net_lot dan dominant_buyer
     for code, entry in agg.items():
         entry["net_lot"] = entry["buy_lot"] - entry["sell_lot"]
         if entry["buyer_counts"]:
             entry["dominant_buyer"] = max(entry["buyer_counts"], key=entry["buyer_counts"].get)
-        del entry["buyer_counts"]  # bersihkan sebelum publish
+        del entry["buyer_counts"]
 
-    # Urutkan berdasarkan |net_lot| — yang paling aktif di atas
     sorted_summary = dict(
         sorted(agg.items(), key=lambda x: abs(x[1]["net_lot"]), reverse=True)
     )
@@ -780,7 +784,6 @@ def fetch_running_trade(token: str, last_trade_number: int = 0) -> Optional[Dict
         "summary": sorted_summary,
     }
 
-    # Publish ke Redis
     try:
         from redis_publisher import publish_running_trade
         publish_running_trade(result)
@@ -792,10 +795,24 @@ def fetch_running_trade(token: str, last_trade_number: int = 0) -> Optional[Dict
 
 def fetch_keystats(symbol: str, token: str) -> Optional[Dict]:
     """
-    Ambil key stats fundamental dari Stockbit untuk satu simbol.
-    Parse dan return dict ringkas untuk AI analyst context.
-    Publish ke Redis (stockbit:keystats:{symbol}) jika berhasil.
+    Ambil key stats fundamental untuk satu simbol.
+    Redis-first: Baca dari stockbit:keystats:{symbol} (diisi Go).
+    Fallback: sb_get() langsung ke API + parse.
     """
+    # --- Try Redis first ---
+    try:
+        from redis_reader import read_keystats
+        redis_data = read_keystats(symbol)
+        if redis_data:
+            ks = {k: v for k, v in redis_data.items()
+                  if k not in ("symbol", "updated_at")}
+            if ks:
+                log.debug(f"  [{symbol}] keystats from Redis")
+                return ks
+    except Exception:
+        pass
+
+    # --- Fallback: API ---
     data = sb_get(f"/keystats/ratio/v1/{symbol}?year_limit=1", token)
     if not data:
         return None
@@ -804,7 +821,6 @@ def fetch_keystats(symbol: str, token: str) -> Optional[Dict]:
     if not items:
         return None
 
-    # Map nama field ke key yang kita inginkan
     name_map = {
         "Current PE Ratio (TTM)":         "pe_ttm",
         "Current EPS (TTM)":              "eps_ttm",
@@ -831,8 +847,6 @@ def fetch_keystats(symbol: str, token: str) -> Optional[Dict]:
             key = name_map.get(name)
             if not key:
                 continue
-
-            # Parse nilai — bersihkan %, koma, tanda kurung (negatif)
             try:
                 val_str = raw_val.replace("%", "").replace(",", "").strip()
                 if val_str in ("-", "", "N/A"):
@@ -847,7 +861,6 @@ def fetch_keystats(symbol: str, token: str) -> Optional[Dict]:
     if not ks:
         return None
 
-    # Publish ke Redis
     try:
         from redis_publisher import publish_keystats as _pub_ks
         _pub_ks(symbol, ks.copy())
@@ -940,17 +953,147 @@ def get_ihsg_context() -> Dict:
 # STEP 2: UNIVERSE FILTER
 # =============================================================================
 
+def _build_stock_entry_from_redis(item: Dict, mover_type: str) -> Dict:
+    """Convert a Redis MarketMoverItem to the screener stock entry format."""
+    return {
+        "ticker": item.get("symbol", ""),
+        "name": item.get("name", item.get("symbol", "")),
+        "price": item.get("price", 0),
+        "change_pct": item.get("change_pct", 0),
+        "value_today": item.get("value_today", 0),
+        "frequency_today": item.get("frequency_today", 0),
+        "net_foreign_today": item.get("net_foreign_today", 0),
+        "iep": 0,
+        "iep_change_pct": 0,
+        "in_mover_types": [mover_type],
+        "from_gainer": mover_type == "MOVER_TYPE_TOP_GAINER",
+        "from_loser": mover_type == "MOVER_TYPE_TOP_LOSER",
+        "from_screener": False,
+        "from_guru": False,
+        "vol_ratio_screener": 0,
+    }
+
+
+def _get_universe_from_redis() -> Optional[List[Dict]]:
+    """
+    Try to build universe from Redis data (populated by Go collector).
+    Returns None if Redis data is not available (triggers API fallback).
+    """
+    try:
+        from redis_reader import read_all_universe
+    except ImportError:
+        return None
+
+    all_data = read_all_universe()
+    if not all_data:
+        return None
+
+    # Check if we have any meaningful data
+    mover_data = all_data.get("mover", [])
+    gainer_data = all_data.get("gainer", [])
+    if not mover_data and not gainer_data:
+        log.info("📡 Redis universe kosong — fallback ke API")
+        return None
+
+    log.info("📡 Membaca universe dari Redis (Go collector)...")
+
+    all_stocks: Dict[str, Dict] = {}
+
+    # --- Market Mover (volume, value, foreign) ---
+    redis_to_mover = {
+        "mover": "MOVER_TYPE_TOP_VOLUME",
+        "top_value": "MOVER_TYPE_TOP_VALUE",
+        "foreign": "MOVER_TYPE_NET_FOREIGN_BUY",
+    }
+    for redis_key, mover_type in redis_to_mover.items():
+        items = all_data.get(redis_key, [])
+        for item in items:
+            code = item.get("symbol", "")
+            if not code:
+                continue
+            if code not in all_stocks:
+                all_stocks[code] = _build_stock_entry_from_redis(item, mover_type)
+            else:
+                if mover_type not in all_stocks[code]["in_mover_types"]:
+                    all_stocks[code]["in_mover_types"].append(mover_type)
+        log.info(f"  Redis {redis_key}: {len(items)} saham")
+
+    # --- Gainer ---
+    for item in all_data.get("gainer", []):
+        code = item.get("symbol", "")
+        if not code:
+            continue
+        if code not in all_stocks:
+            all_stocks[code] = _build_stock_entry_from_redis(item, "MOVER_TYPE_TOP_GAINER")
+        else:
+            all_stocks[code]["from_gainer"] = True
+            all_stocks[code]["in_mover_types"].append("MOVER_TYPE_TOP_GAINER")
+            all_stocks[code]["change_pct"] = item.get("change_pct", 0)
+
+    # --- Loser ---
+    for item in all_data.get("loser", []):
+        code = item.get("symbol", "")
+        if not code:
+            continue
+        if code not in all_stocks:
+            all_stocks[code] = _build_stock_entry_from_redis(item, "MOVER_TYPE_TOP_LOSER")
+        else:
+            all_stocks[code]["from_loser"] = True
+            all_stocks[code]["in_mover_types"].append("MOVER_TYPE_TOP_LOSER")
+
+    # --- Guru Screener ---
+    from redis_reader import GURU_TEMPLATE_IDS
+    guru_label_map = {
+        92: "Big Accumulation", 77: "Foreign Flow Uptrend",
+        94: "Bandar Bullish Reversal", 87: "Reversal on Bearish Trend",
+        88: "Potential Reversal", 63: "High Volume Breakout",
+        97: "Frequency Spike", 72: "IHSG Outperformers",
+        78: "Daily Net Foreign Flow", 79: "1 Week Net Foreign Flow",
+    }
+    for tid in GURU_TEMPLATE_IDS:
+        tickers = all_data.get(f"guru_{tid}", [])
+        label = guru_label_map.get(tid, str(tid))
+        for ticker_str in tickers:
+            if not ticker_str:
+                continue
+            if ticker_str not in all_stocks:
+                all_stocks[ticker_str] = {
+                    "ticker": ticker_str, "name": ticker_str,
+                    "price": 0, "change_pct": 0, "value_today": 0,
+                    "frequency_today": 0, "net_foreign_today": 0,
+                    "iep": 0, "iep_change_pct": 0,
+                    "in_mover_types": [f"GURU_{tid}"],
+                    "from_gainer": False, "from_loser": False,
+                    "from_screener": False, "from_guru": True,
+                    "vol_ratio_screener": 0,
+                    "guru_template_id": tid, "guru_template_name": label,
+                }
+            else:
+                all_stocks[ticker_str]["from_guru"] = True
+                all_stocks[ticker_str]["in_mover_types"].append(f"GURU_{tid}_{label[:12]}")
+
+    result = list(all_stocks.values())
+    log.info(f"✅ Universe dari Redis: {len(result)} saham unik")
+    return result
+
+
 def get_universe_mode_a(token: str) -> List[Dict]:
     """
-    Ambil universe dari 3 sumber dan gabungkan:
-    1. Market Mover Stockbit (TOP_VOLUME + TOP_VALUE + NET_FOREIGN_BUY)
-    2. Top Gainer hari ini (kandidat momentum besok)
-    3. Screener Volume Explosion (volume spike = akumulasi dini)
+    Ambil universe dari Redis (Go collector) atau fallback ke API langsung.
+
+    Redis-first: Jika Go collector sudah mengisi Redis, baca dari sana.
+    API-fallback: Jika Redis kosong, gunakan sb_get() langsung (legacy).
 
     Deduplication berdasarkan ticker — saham yang muncul di beberapa
     sumber mendapat flag tambahan dan bobot lebih tinggi di scoring.
     """
-    log.info("🎯 Universe MODE A: Market Mover + Gainer + Loser + Screener + Guru...")
+    # --- Try Redis first (data from Go collector) ---
+    redis_result = _get_universe_from_redis()
+    if redis_result is not None and len(redis_result) > 0:
+        return redis_result
+
+    # --- Fallback: Legacy API calls ---
+    log.info("🎯 Universe MODE A (API fallback): Market Mover + Gainer + Loser + Screener + Guru...")
 
     mover_types = [
         "MOVER_TYPE_TOP_VOLUME",
@@ -1084,12 +1227,11 @@ def get_universe_mode_a(token: str) -> List[Dict]:
         else:
             all_stocks[code]["from_top_value"] = True
             all_stocks[code]["in_mover_types"].append("SCREENER_TOP_VALUE")
-            # Update value_today kalau lebih akurat dari sumber lain
             if tv.get("value_today", 0) > 0 and all_stocks[code].get("value_today", 0) == 0:
                 all_stocks[code]["value_today"] = tv["value_today"]
 
     result = list(all_stocks.values())
-    log.info(f"✅ Universe MODE A: {len(result)} saham unik (MM + Gainer + Loser + Screener + Guru + TopValue)")
+    log.info(f"✅ Universe MODE A (API): {len(result)} saham unik (MM + Gainer + Loser + Screener + Guru + TopValue)")
     return result
 
 
@@ -1663,21 +1805,37 @@ def get_universe_guru_screener(token: str) -> List[Dict]:
 def check_liquidity_quality(ticker: str, token: str) -> Tuple[bool, Optional[Dict]]:
     """
     Cek konsistensi likuiditas 20 hari via Historical Summary.
+    Redis-first: Baca dari stockbit:hist:{ticker} (diisi Go).
+    Fallback: sb_get() langsung ke API jika Redis kosong.
     Return (lolos: bool, hist_data: dict dengan PDH/PDL/PDC + foreign 20 hari)
     """
-    data = sb_get(
-        f"/company-price-feed/historical/summary/{ticker}",
-        token,
-        {"period": "HS_PERIOD_DAILY", "limit": 20},
-    )
-    if not data:
-        return False, None
+    result = None
 
-    result = data.get("data", {}).get("result", [])
+    # --- Try Redis first ---
+    try:
+        from redis_reader import read_historical
+        redis_data = read_historical(ticker)
+        if redis_data and redis_data.get("bars"):
+            result = redis_data["bars"]
+            log.debug(f"  [{ticker}] hist from Redis ({len(result)} bars)")
+    except Exception:
+        pass
+
+    # --- Fallback: API ---
+    if result is None:
+        data = sb_get(
+            f"/company-price-feed/historical/summary/{ticker}",
+            token,
+            {"period": "HS_PERIOD_DAILY", "limit": 20},
+        )
+        if not data:
+            return False, None
+        result = data.get("data", {}).get("result", [])
+
     if len(result) < 5:
         return False, None
 
-    # Hari kemarin = index 0 (newest first dari API)
+    # Hari kemarin = index 0 (newest first dari API/Redis)
     yesterday = result[0]
     pdh = yesterday.get("high", 0)
     pdl = yesterday.get("low", 0)
@@ -1728,7 +1886,7 @@ def check_liquidity_quality(ticker: str, token: str) -> Tuple[bool, Optional[Dic
             "foreign_buy": day.get("foreign_buy", 0),
             "foreign_sell": day.get("foreign_sell", 0),
             "net_foreign": day.get("net_foreign", 0),
-            "change_pct": day.get("change_percentage", 0),
+            "change_pct": day.get("change_pct", day.get("change_percentage", 0)),
         })
 
     # PDTypical
@@ -1751,10 +1909,25 @@ def check_liquidity_quality(ticker: str, token: str) -> Tuple[bool, Optional[Dic
 
 def get_broker_signal(ticker: str, token: str) -> Tuple[str, int]:
     """
-    Ambil broker signal (bandar detector) dari Stockbit.
+    Ambil broker signal (bandar detector).
+    Redis-first: Baca dari stockbit:broker:{ticker} (diisi Go).
+    Fallback: sb_get() langsung ke API.
     Return (signal_label, score)
     signal_label: Big Acc | Acc | Neutral | Dist | Big Dist
     """
+    # --- Try Redis first ---
+    try:
+        from redis_reader import read_broker_signal
+        redis_data = read_broker_signal(ticker)
+        if redis_data and redis_data.get("label"):
+            label = redis_data["label"]
+            score = redis_data.get("score", 5)
+            log.debug(f"  [{ticker}] broker from Redis: {label} -> score {score}")
+            return label, score
+    except Exception:
+        pass
+
+    # --- Fallback: API ---
     data = sb_get(
         f"/marketdetectors/{ticker}",
         token,
@@ -1769,16 +1942,12 @@ def get_broker_signal(ticker: str, token: str) -> Tuple[str, int]:
         return "Neutral", 5
 
     try:
-        # Coba beberapa path yang mungkin dari Stockbit API
-        # Path 1 (dokumentasi awal): data.bandar_detector.avg.accdist
         accdist = (
             data.get("data", {})
             .get("bandar_detector", {})
             .get("avg", {})
             .get("accdist", "")
         )
-
-        # Path 2: data.result.bandar_detector.avg.accdist
         if not accdist:
             accdist = (
                 data.get("data", {})
@@ -1787,25 +1956,18 @@ def get_broker_signal(ticker: str, token: str) -> Tuple[str, int]:
                 .get("avg", {})
                 .get("accdist", "")
             )
-
-        # Path 3: data.bandar_detector.accdist (tanpa avg)
         if not accdist:
             accdist = (
                 data.get("data", {})
                 .get("bandar_detector", {})
                 .get("accdist", "")
             )
-
-        # Path 4: data.accdist langsung
         if not accdist:
             accdist = data.get("data", {}).get("accdist", "")
-
         if not accdist:
-            # Log struktur response untuk debug jika semua path gagal
             top_keys = list((data.get("data") or data).keys())[:6]
-            log.debug(f"  [{ticker}] broker response keys: {top_keys} — default Neutral")
+            log.debug(f"  [{ticker}] broker response keys: {top_keys} -- default Neutral")
             accdist = "Neutral"
-
     except Exception as e:
         log.debug(f"  [{ticker}] broker signal parse error: {e}")
         accdist = "Neutral"
@@ -1814,12 +1976,13 @@ def get_broker_signal(ticker: str, token: str) -> Tuple[str, int]:
         "Big Acc": 35,
         "Acc":     20,
         "Neutral": 5,
-        "Dist":    -999,   # SKIP
-        "Big Dist":-999,   # SKIP
+        "Dist":    -999,
+        "Big Dist":-999,
     }
     score = score_map.get(accdist, 5)
-    log.debug(f"  [{ticker}] broker signal: {accdist} → score {score}")
+    log.debug(f"  [{ticker}] broker signal: {accdist} -> score {score}")
     return accdist, score
+
 
 
 def calculate_accumulation_score(
@@ -2525,17 +2688,29 @@ def round_bei(price: float) -> int:
 
 
 def get_bid_wall(ticker: str, token: str) -> Optional[float]:
-    """Ambil level bid wall dari orderbook Stockbit."""
-    data = sb_get(f"/company-price-feed/v2/orderbook/companies/{ticker}", token)
-    if not data:
+    """Ambil level bid wall dari orderbook. Redis-first, fallback API."""
+    bids = None
+
+    # --- Try Redis first ---
+    try:
+        from redis_reader import read_orderbook
+        ob_data = read_orderbook(ticker)
+        if ob_data and ob_data.get("bids"):
+            bids = ob_data["bids"]
+    except Exception:
+        pass
+
+    # --- Fallback: API ---
+    if bids is None:
+        data = sb_get(f"/company-price-feed/v2/orderbook/companies/{ticker}", token)
+        if not data:
+            return None
+        bids = data.get("data", {}).get("bids", data.get("data", {}).get("bid", []))
+
+    if not bids:
         return None
 
     try:
-        bids = data.get("data", {}).get("bids", [])
-        if not bids:
-            return None
-
-        # Hitung total volume per level
         bid_volumes = {}
         for bid in bids:
             price = bid.get("price", 0)
@@ -2547,13 +2722,11 @@ def get_bid_wall(ticker: str, token: str) -> Optional[float]:
             return None
 
         avg_vol = sum(bid_volumes.values()) / len(bid_volumes)
-        # Bid wall: volume > 2× rata-rata
         walls = {p: v for p, v in bid_volumes.items() if v >= (2 * avg_vol)}
 
         if not walls:
             return None
 
-        # Ambil bid wall terdekat dari current price (tertinggi)
         return float(max(walls.keys()))
 
     except Exception:
@@ -3209,17 +3382,42 @@ def run_screener():
         log.info(f"📅 {session_label} — screening tetap jalan untuk persiapan market")
 
     # ----------------------------------------------------------------
-    # STEP 0: Token & Mode
+    # STEP 0: Redis health check + Token & Mode
     # ----------------------------------------------------------------
-    log.info("\n[STEP 0] Token management...")
-    token, mode = get_valid_token()
+    log.info("\n[STEP 0] Data source check...")
+
+    redis_available = False
+    try:
+        from redis_reader import check_redis_data_available
+        redis_available = check_redis_data_available()
+    except Exception:
+        pass
+
+    if redis_available:
+        log.info("  Redis data tersedia (Go collector aktif)")
+    else:
+        log.info("  Redis data belum tersedia, fallback ke API langsung")
+
+    token, mode = None, "YAHOO_ONLY"
+    try:
+        token, mode = get_valid_token()
+    except Exception as e:
+        if redis_available:
+            log.warning(f"  Token gagal tapi Redis tersedia, lanjut: {e}")
+            mode = "FULL_STOCKBIT"
+        else:
+            raise
+
+    if redis_available and mode != "FULL_STOCKBIT":
+        mode = "FULL_STOCKBIT"
+        log.info("  Override mode ke FULL_STOCKBIT (data dari Redis)")
 
     if os.environ.get("FORCE_MODE") == "YAHOO_ONLY":
         mode = "YAHOO_ONLY"
         token = None
-        log.info("⚙️ Override: YAHOO_ONLY mode")
+        log.info("  Override: YAHOO_ONLY mode (env FORCE_MODE)")
 
-    log.info(f"Mode aktif: {mode}")
+    log.info(f"  Mode: {mode} | Token: {'ada' if token else 'tidak'} | Redis: {'aktif' if redis_available else 'tidak'}")
 
     # ----------------------------------------------------------------
     # STEP 1: Market Context
@@ -3231,6 +3429,15 @@ def run_screener():
         log.warning("🛑 Market tidak aman — output kosong")
         save_output([], mode, market_ctx, {"stopped": "market_unsafe"}, session_label)
         return
+
+    # ----------------------------------------------------------------
+    # STEP 1b: Running Trade (Redis-first, token optional)
+    # ----------------------------------------------------------------
+    log.info("\n[STEP 1b] Running trade...")
+    try:
+        fetch_running_trade(token or "")
+    except Exception as e:
+        log.warning(f"  Running trade skipped: {e}")
 
     # ----------------------------------------------------------------
     # STEP 2: Universe
@@ -3399,6 +3606,19 @@ def run_screener():
             mode=mode,
         )
         results.append(stock_out)
+
+    # ----------------------------------------------------------------
+    # STEP 9b: Keystats fundamental per saham watchlist → Redis
+    # ----------------------------------------------------------------
+    if token and results:
+        log.info("\n[STEP 9b] Keystats fundamental untuk watchlist...")
+        for stock_out in results:
+            sym = stock_out.get("ticker", "")
+            if sym:
+                try:
+                    fetch_keystats(sym, token)
+                except Exception as e:
+                    log.warning(f"⚠️ Keystats {sym} skipped: {e}")
 
     save_output(results, mode, market_ctx, summary, session_label)
 
@@ -4771,8 +4991,20 @@ Contoh penggunaan:
 
     try:
         if args.ara_only:
-            log.info("🎯 Mode: ARA v2 Pipeline Only")
-            token_r, mode_r = get_valid_token()
+            log.info("Mode: ARA v2 Pipeline Only")
+            token_r, mode_r = None, "YAHOO_ONLY"
+            try:
+                token_r, mode_r = get_valid_token()
+            except Exception as e:
+                try:
+                    from redis_reader import check_redis_data_available
+                    if check_redis_data_available():
+                        mode_r = "FULL_STOCKBIT"
+                        log.warning(f"Token gagal, lanjut dengan Redis: {e}")
+                    else:
+                        raise
+                except ImportError:
+                    raise
             market_r = get_ihsg_context()
             ara_r = run_ara_pipeline_v2(token_r, mode_r)
             save_combined_output_v2(

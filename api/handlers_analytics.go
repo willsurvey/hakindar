@@ -69,6 +69,186 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 		followups = []database.WhaleAlertFollowup{}
 	}
 
+	// ── Fase 1: Fetch Redis enrichment (non-fatal) ────────────────────────────
+	redisCtx := &llm.SymbolRedisContext{}
+	if s.redisCache != nil {
+		// 1. Company Info
+		var ci struct {
+			Name      string   `json:"name"`
+			Sector    string   `json:"sector"`
+			SubSector string   `json:"sub_sector"`
+			Price     string   `json:"price"`
+			Pct       float64  `json:"pct"`
+			Volume    string   `json:"volume"`
+			Indexes   []string `json:"indexes"`
+		}
+		if err := s.redisCache.Get(r.Context(), fmt.Sprintf("stockbit:company_info:%s", symbol), &ci); err == nil {
+			redisCtx.Name = ci.Name
+			redisCtx.Sector = ci.Sector
+			redisCtx.SubSector = ci.SubSector
+			redisCtx.Price = ci.Price
+			redisCtx.ChangePct = ci.Pct
+			redisCtx.Volume = ci.Volume
+			redisCtx.Indexes = ci.Indexes
+		} else {
+			log.Printf("ℹ️  Redis company_info miss for %s: %v", symbol, err)
+		}
+
+		// 2. Running Trade — extract symbol's entry
+		var rt struct {
+			Summary map[string]struct {
+				BuyLot        int    `json:"buy_lot"`
+				SellLot       int    `json:"sell_lot"`
+				NetLot        int    `json:"net_lot"`
+				ForeignNet    int    `json:"foreign_net"`
+				DominantBuyer string `json:"dominant_buyer"`
+			} `json:"summary"`
+		}
+		if err := s.redisCache.Get(r.Context(), "stockbit:running_trade", &rt); err == nil {
+			if item, ok := rt.Summary[symbol]; ok {
+				redisCtx.RTBuyLot = item.BuyLot
+				redisCtx.RTSellLot = item.SellLot
+				redisCtx.RTNetLot = item.NetLot
+				redisCtx.RTForeignNet = item.ForeignNet
+				redisCtx.RTDominantBuyer = item.DominantBuyer
+				redisCtx.RTAvailable = true
+			} else {
+				log.Printf("ℹ️  Running trade: symbol %s not found in snapshot", symbol)
+			}
+		} else {
+			log.Printf("ℹ️  Redis running_trade miss: %v", err)
+		}
+
+		// 3. Broker Signal (Bandar Detector)
+		var bs struct {
+			Label string `json:"label"`
+			Score int    `json:"score"`
+		}
+		if err := s.redisCache.Get(r.Context(), fmt.Sprintf("stockbit:broker:%s", symbol), &bs); err == nil {
+			redisCtx.BrokerLabel = bs.Label
+			redisCtx.BrokerScore = bs.Score
+			redisCtx.BrokerAvail = true
+		} else {
+			log.Printf("ℹ️  Redis broker_signal miss for %s: %v", symbol, err)
+		}
+
+		// ── Fase 2: Keystats & Historical ─────────────────────────────────────
+
+		// 4. Fundamental Keystats
+		var ks struct {
+			PeTTM            *float64 `json:"pe_ttm"`
+			RoeTTM           *float64 `json:"roe_ttm"`
+			PBV              *float64 `json:"pbv"`
+			DividendYield    *float64 `json:"dividend_yield"`
+			RevenueGrowthYoY *float64 `json:"revenue_growth_yoy"`
+			PiotroskiScore   *float64 `json:"piotroski_score"`
+			High52W          *float64 `json:"high_52w"`
+			Low52W           *float64 `json:"low_52w"`
+			DebtToEquity     *float64 `json:"debt_to_equity"`
+		}
+		if err := s.redisCache.Get(r.Context(), fmt.Sprintf("stockbit:keystats:%s", symbol), &ks); err == nil {
+			redisCtx.PeTTM = ks.PeTTM
+			redisCtx.RoeTTM = ks.RoeTTM
+			redisCtx.PBV = ks.PBV
+			redisCtx.DividendYield = ks.DividendYield
+			redisCtx.RevenueGrowthYoY = ks.RevenueGrowthYoY
+			redisCtx.PiotroskiScore = ks.PiotroskiScore
+			redisCtx.High52W = ks.High52W
+			redisCtx.Low52W = ks.Low52W
+			redisCtx.DebtToEquity = ks.DebtToEquity
+			redisCtx.KeystatsAvail = true
+		} else {
+			log.Printf("ℹ️  Redis keystats miss for %s: %v", symbol, err)
+		}
+
+		// 5. Historical Daily Bars (last 5 days)
+		var hist struct {
+			Bars []struct {
+				Date        string  `json:"date"`
+				Close       float64 `json:"close"`
+				Volume      int64   `json:"volume"`
+				NetForeign  float64 `json:"net_foreign"`
+				ChangePct   float64 `json:"change_pct"`
+			} `json:"bars"`
+		}
+		if err := s.redisCache.Get(r.Context(), fmt.Sprintf("stockbit:hist:%s", symbol), &hist); err == nil {
+			limit := 5
+			if len(hist.Bars) < limit {
+				limit = len(hist.Bars)
+			}
+			for i := 0; i < limit; i++ {
+				b := hist.Bars[i]
+				redisCtx.HistBars = append(redisCtx.HistBars, llm.HistBar{
+					Date:       b.Date,
+					Close:      b.Close,
+					ChangePct:  b.ChangePct,
+					Volume:     b.Volume,
+					NetForeign: b.NetForeign,
+				})
+			}
+		} else {
+			log.Printf("ℹ️  Redis hist miss for %s: %v", symbol, err)
+		}
+
+		// ── Fase 3: Orderbook & Market Mover ──────────────────────────────────
+
+		// 6. Orderbook (top 3 bid & ask)
+		var ob struct {
+			Bids []struct {
+				Price float64 `json:"price"`
+				Lot   int64   `json:"lot"`
+			} `json:"bids"`
+			Asks []struct {
+				Price float64 `json:"price"`
+				Lot   int64   `json:"lot"`
+			} `json:"asks"`
+		}
+		if err := s.redisCache.Get(r.Context(), fmt.Sprintf("stockbit:orderbook:%s", symbol), &ob); err == nil {
+			limit := 3
+			for i := 0; i < limit && i < len(ob.Bids); i++ {
+				redisCtx.TopBids = append(redisCtx.TopBids, llm.OBLevel{
+					Price: ob.Bids[i].Price,
+					Lot:   ob.Bids[i].Lot,
+				})
+			}
+			for i := 0; i < limit && i < len(ob.Asks); i++ {
+				redisCtx.TopAsks = append(redisCtx.TopAsks, llm.OBLevel{
+					Price: ob.Asks[i].Price,
+					Lot:   ob.Asks[i].Lot,
+				})
+			}
+			redisCtx.OrderbookAvail = true
+		} else {
+			log.Printf("ℹ️  Redis orderbook miss for %s: %v", symbol, err)
+		}
+
+		// 7. Market Mover Positioning — check which universe lists contain this symbol
+		moverChecks := []struct {
+			key   string
+			setFn func()
+		}{
+			{"stockbit:universe:mover", func() { redisCtx.InTopVolume = true }},
+			{"stockbit:universe:top_value", func() { redisCtx.InTopValue = true }},
+			{"stockbit:universe:foreign", func() { redisCtx.InForeignBuy = true }},
+			{"stockbit:universe:gainer", func() { redisCtx.InTopGainer = true }},
+			{"stockbit:universe:loser", func() { redisCtx.InTopLoser = true }},
+		}
+		for _, mc := range moverChecks {
+			var items []struct {
+				Symbol string `json:"symbol"`
+			}
+			if err := s.redisCache.Get(r.Context(), mc.key, &items); err == nil {
+				for _, item := range items {
+					if item.Symbol == symbol {
+						mc.setFn()
+						break
+					}
+				}
+			}
+		}
+	}
+	// ─────────────────────────────────────────────────────────────────────────
+
 	// Set SSE headers
 	flusher, ok := setupSSE(w)
 	if !ok {
@@ -86,7 +266,7 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 			symbol,
 		)
 	} else {
-		prompt = llm.FormatSymbolAnalysisPrompt(symbol, alerts, baseline, orderFlow, followups)
+		prompt = llm.FormatSymbolAnalysisPrompt(symbol, alerts, baseline, orderFlow, followups, redisCtx)
 	}
 
 	// Stream LLM response
@@ -326,6 +506,53 @@ func (s *Server) handleCustomPromptStream(w http.ResponseWriter, r *http.Request
 						"- %-6s | PE=%s | ROE=%s%% | Div=%s%% | PBV=%s | RevGrow=%s%% | F-Score=%s\n",
 						sym, getF("pe_ttm"), getF("roe_ttm"), getF("dividend_yield"),
 						getF("pbv"), getF("revenue_growth_yoy"), getF("piotroski_score"),
+					))
+				}
+				contextBuilder.WriteString("\n")
+			}
+
+		case "company_info":
+			// Get company profile per symbol from Redis (populated by Go StockbitCollector)
+			if s.redisCache == nil {
+				log.Printf("company_info: redisCache not configured")
+				break
+			}
+			if len(reqBody.Symbols) > 0 {
+				contextBuilder.WriteString("=== PROFIL PERUSAHAAN ===\n")
+				contextBuilder.WriteString("Format: SIMBOL | Nama | Sektor | Harga | Change% | Indeks utama\n")
+				for _, sym := range reqBody.Symbols {
+					var ci struct {
+						Symbol    string   `json:"symbol"`
+						Name      string   `json:"name"`
+						Sector    string   `json:"sector"`
+						SubSector string   `json:"sub_sector"`
+						Price     string   `json:"price"`
+						Change    string   `json:"change"`
+						Pct       float64  `json:"pct"`
+						Indexes   []string `json:"indexes"`
+					}
+					if err := s.redisCache.Get(r.Context(), fmt.Sprintf("stockbit:company_info:%s", sym), &ci); err != nil {
+						contextBuilder.WriteString(fmt.Sprintf("- %s: profil belum tersedia\n", sym))
+						continue
+					}
+					// Pick notable indexes
+					notable := []string{}
+					priority := []string{"LQ45", "IDX30", "IDX80", "IHSG", "IDXBUMN20", "IDXHIDIV20"}
+					for _, p := range priority {
+						for _, idx := range ci.Indexes {
+							if idx == p {
+								notable = append(notable, p)
+								break
+							}
+						}
+					}
+					idxStr := strings.Join(notable, ", ")
+					if idxStr == "" {
+						idxStr = "-"
+					}
+					contextBuilder.WriteString(fmt.Sprintf(
+						"- %-6s | %s | %s/%s | Rp%s (%+.2f%%) | Indeks: %s\n",
+						sym, ci.Name, ci.Sector, ci.SubSector, ci.Price, ci.Pct, idxStr,
 					))
 				}
 				contextBuilder.WriteString("\n")
