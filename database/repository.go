@@ -113,8 +113,13 @@ func (r *TradeRepository) InitSchema() error {
 		return err
 	}
 
-	// Auto-migrate remaining tables
-	if err := r.db.db.AutoMigrate(&WhaleWebhook{}, &models.DailyOHLCV{}); err != nil {
+	// Auto-migrate remaining tables (including new master data tables)
+	if err := r.db.db.AutoMigrate(
+		&WhaleWebhook{},
+		&models.DailyOHLCV{},
+		&models.CompanyProfile{},
+		&models.FundamentalKeystat{},
+	); err != nil {
 		return fmt.Errorf("auto-migration failed: %w", err)
 	}
 
@@ -1190,4 +1195,101 @@ func (r *TradeRepository) GetMLTrainingDataStats() (map[string]interface{}, erro
 	stats["training_records_by_outcome"] = recordsByOutcome
 
 	return stats, nil
+}
+
+// ============================================================================
+// CompanyProfile Methods — Master Data (Permanent PostgreSQL Storage)
+// ============================================================================
+
+// UpsertCompanyProfile inserts or updates a company profile record.
+// Uses ON CONFLICT (symbol) DO UPDATE so it is safe to call repeatedly.
+func (r *TradeRepository) UpsertCompanyProfile(profile *models.CompanyProfile) error {
+	return r.db.db.
+		Where(models.CompanyProfile{Symbol: profile.Symbol}).
+		Assign(models.CompanyProfile{
+			Name:      profile.Name,
+			Sector:    profile.Sector,
+			SubSector: profile.SubSector,
+			Indexes:   profile.Indexes,
+		}).
+		FirstOrCreate(profile).Error
+}
+
+// GetCompanyProfile retrieves a company profile by symbol.
+// Returns nil, nil when the symbol does not exist in the database (not an error).
+func (r *TradeRepository) GetCompanyProfile(symbol string) (*models.CompanyProfile, error) {
+	var profile models.CompanyProfile
+	err := r.db.db.Where("symbol = ?", symbol).First(&profile).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+	return &profile, err
+}
+
+// CountCompanyProfiles returns the total number of company profiles stored.
+// Used by bootstrap trigger: if count < 100, full-market bootstrap is needed.
+func (r *TradeRepository) CountCompanyProfiles() (int64, error) {
+	var count int64
+	err := r.db.db.Model(&models.CompanyProfile{}).Count(&count).Error
+	return count, err
+}
+
+// GetAllProfiledSymbols returns all symbol strings that already have a profile.
+// Used by the bootstrapper to skip symbols that were already fetched.
+func (r *TradeRepository) GetAllProfiledSymbols() ([]string, error) {
+	var symbols []string
+	err := r.db.db.Model(&models.CompanyProfile{}).
+		Pluck("symbol", &symbols).Error
+	return symbols, err
+}
+
+// CountTradesForDateSymbol counts running_trades rows for a specific symbol
+// within a given time range (start inclusive, end exclusive).
+// Used by Historical Tick Scraper (Task 3.3) to implement idempotent checks:
+// if count >= 10, data for that day already exists — skip re-fetching.
+func (r *TradeRepository) CountTradesForDateSymbol(symbol string, start, end time.Time, count *int64) error {
+	return r.db.db.Table("running_trades").
+		Where("stock_symbol = ? AND timestamp >= ? AND timestamp < ?", symbol, start, end).
+		Count(count).Error
+}
+
+// ============================================================================
+// FundamentalKeystat Methods — Quarterly Valuation Snapshots
+// ============================================================================
+
+// UpsertFundamentalKeystat inserts or updates a fundamental keystats record.
+// Safe to call daily — will update the existing record for the same symbol.
+func (r *TradeRepository) UpsertFundamentalKeystat(ks *models.FundamentalKeystat) error {
+	return r.db.db.
+		Where(models.FundamentalKeystat{Symbol: ks.Symbol}).
+		Assign(models.FundamentalKeystat{
+			PeTTM:            ks.PeTTM,
+			EpsTTM:           ks.EpsTTM,
+			RoeTTM:           ks.RoeTTM,
+			RoaTTM:           ks.RoaTTM,
+			NetProfitMargin:  ks.NetProfitMargin,
+			RevenueGrowthYoY: ks.RevenueGrowthYoY,
+			NetIncomeGrowth:  ks.NetIncomeGrowth,
+			DividendYield:    ks.DividendYield,
+			PiotroskiScore:   ks.PiotroskiScore,
+			High52W:          ks.High52W,
+			Low52W:           ks.Low52W,
+			PriceReturnYTD:   ks.PriceReturnYTD,
+			DebtToEquity:     ks.DebtToEquity,
+			EvEbitda:         ks.EvEbitda,
+			PBV:              ks.PBV,
+			FetchedAt:        ks.FetchedAt,
+		}).
+		FirstOrCreate(ks).Error
+}
+
+// GetFundamentalKeystat retrieves the latest fundamental keystats for a symbol.
+// Returns nil, nil when no data exists yet (not an error — bootstrapper may still be running).
+func (r *TradeRepository) GetFundamentalKeystat(symbol string) (*models.FundamentalKeystat, error) {
+	var ks models.FundamentalKeystat
+	err := r.db.db.Where("symbol = ?", symbol).First(&ks).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+	return &ks, err
 }

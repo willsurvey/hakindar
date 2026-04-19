@@ -452,3 +452,65 @@ type DailyOHLCV struct {
 func (DailyOHLCV) TableName() string {
 	return "daily_ohlcv"
 }
+
+// CompanyProfile stores permanent master data for each emiten (stock company).
+// This data is static and should NEVER be stored in Redis alone.
+// Source: Stockbit /emitten/{symbol}/info API
+//
+// Key Fields:
+//   - Symbol: Stock ticker (Primary Key, e.g. "BBCA", "BMRI")
+//   - Name: Official company name from Stockbit (e.g. "Bank Central Asia Tbk.")
+//   - Sector: BEI sector classification (e.g. "Finance")
+//   - SubSector: BEI sub-sector (e.g. "Banking")
+//   - Indexes: JSON array of index memberships (e.g. ["LQ45","IDX30","IDX80"])
+//   - UpdatedAt: Last time this profile was refreshed from Stockbit
+type CompanyProfile struct {
+	Symbol    string    `gorm:"primaryKey;size:10;not null" json:"symbol"`
+	Name      string    `gorm:"type:text;not null" json:"name"`
+	Sector    string    `gorm:"type:text" json:"sector"`
+	SubSector string    `gorm:"type:text" json:"sub_sector"`
+	Indexes   string    `gorm:"type:text" json:"indexes"` // JSON array: ["LQ45","IDX30"]
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+}
+
+// TableName specifies the table name for CompanyProfile
+func (CompanyProfile) TableName() string {
+	return "company_profiles"
+}
+
+// FundamentalKeystat stores quarterly fundamental valuation snapshot per emiten.
+// Data sourced from Stockbit /keystats/{symbol} API.
+// Updated once daily (not every 10 minutes) — values only change per quarter.
+//
+// Key Fields:
+//   - Symbol: Stock ticker (Primary Key, FK to company_profiles)
+//   - PeTTM: Price-to-Earnings Trailing Twelve Months
+//   - PBV: Price-to-Book Value
+//   - RoeTTM: Return on Equity TTM
+//   - PiotroskiScore: Piotroski F-Score (0-9, higher = stronger fundamentals)
+//   - High52W / Low52W: 52-week price range
+//   - FetchedAt: When this snapshot was retrieved from Stockbit
+type FundamentalKeystat struct {
+	Symbol           string    `gorm:"primaryKey;size:10;not null" json:"symbol"`
+	PeTTM            *float64  `gorm:"type:decimal(10,4)" json:"pe_ttm"`
+	EpsTTM           *float64  `gorm:"type:decimal(15,4)" json:"eps_ttm"`
+	RoeTTM           *float64  `gorm:"type:decimal(10,4)" json:"roe_ttm"`
+	RoaTTM           *float64  `gorm:"type:decimal(10,4)" json:"roa_ttm"`
+	NetProfitMargin  *float64  `gorm:"type:decimal(10,4)" json:"net_profit_margin"`
+	RevenueGrowthYoY *float64  `gorm:"type:decimal(10,4)" json:"revenue_growth_yoy"`
+	NetIncomeGrowth  *float64  `gorm:"type:decimal(10,4)" json:"net_income_growth_yoy"`
+	DividendYield    *float64  `gorm:"type:decimal(10,4)" json:"dividend_yield"`
+	PiotroskiScore   *float64  `gorm:"type:decimal(5,2)" json:"piotroski_score"`
+	High52W          *float64  `gorm:"type:decimal(15,2)" json:"high_52w"`
+	Low52W           *float64  `gorm:"type:decimal(15,2)" json:"low_52w"`
+	PriceReturnYTD   *float64  `gorm:"type:decimal(10,4)" json:"price_return_ytd"`
+	DebtToEquity     *float64  `gorm:"type:decimal(10,4)" json:"debt_to_equity"`
+	EvEbitda         *float64  `gorm:"type:decimal(10,4)" json:"ev_ebitda"`
+	PBV              *float64  `gorm:"type:decimal(10,4)" json:"pbv"`
+	FetchedAt        time.Time `gorm:"not null" json:"fetched_at"`
+}
+
+// TableName specifies the table name for FundamentalKeystat
+func (FundamentalKeystat) TableName() string {
+	return "fundamental_keystats"
+}

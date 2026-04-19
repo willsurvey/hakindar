@@ -69,10 +69,10 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 		followups = []database.WhaleAlertFollowup{}
 	}
 
-	// ── Fase 1: Fetch Redis enrichment (non-fatal) ────────────────────────────
+	// ── Fase 1: Fetch enrichment — Redis first, PostgreSQL fallback ───────────
 	redisCtx := &llm.SymbolRedisContext{}
 	if s.redisCache != nil {
-		// 1. Company Info
+		// 1. Company Info — Redis first
 		var ci struct {
 			Name      string   `json:"name"`
 			Sector    string   `json:"sector"`
@@ -91,7 +91,20 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 			redisCtx.Volume = ci.Volume
 			redisCtx.Indexes = ci.Indexes
 		} else {
-			log.Printf("ℹ️  Redis company_info miss for %s: %v", symbol, err)
+			// Task 5.1 — Redis miss: fallback ke PostgreSQL (data permanen)
+			log.Printf("ℹ️  Redis company_info miss for %s, querying PostgreSQL...", symbol)
+			if s.repo != nil {
+				if profile, dbErr := s.repo.GetCompanyProfile(symbol); dbErr == nil && profile != nil {
+					redisCtx.Name = profile.Name
+					redisCtx.Sector = profile.Sector
+					redisCtx.SubSector = profile.SubSector
+					// Parse JSON indexes string back to []string
+					_ = json.Unmarshal([]byte(profile.Indexes), &redisCtx.Indexes)
+					log.Printf("✅ PostgreSQL company_profile hit for %s: %s", symbol, profile.Name)
+				} else {
+					log.Printf("ℹ️  PostgreSQL also has no profile for %s", symbol)
+				}
+			}
 		}
 
 		// 2. Running Trade — extract symbol's entry
@@ -134,7 +147,7 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 
 		// ── Fase 2: Keystats & Historical ─────────────────────────────────────
 
-		// 4. Fundamental Keystats
+		// Task 5.2 — Keystats: Redis first, lalu PostgreSQL fallback
 		var ks struct {
 			PeTTM            *float64 `json:"pe_ttm"`
 			RoeTTM           *float64 `json:"roe_ttm"`
@@ -158,7 +171,25 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 			redisCtx.DebtToEquity = ks.DebtToEquity
 			redisCtx.KeystatsAvail = true
 		} else {
-			log.Printf("ℹ️  Redis keystats miss for %s: %v", symbol, err)
+			// Redis miss: fallback ke PostgreSQL (data permanen, tidak hilang saat Redis restart)
+			log.Printf("ℹ️  Redis keystats miss for %s, querying PostgreSQL...", symbol)
+			if s.repo != nil {
+				if dbKs, dbErr := s.repo.GetFundamentalKeystat(symbol); dbErr == nil && dbKs != nil {
+					redisCtx.PeTTM = dbKs.PeTTM
+					redisCtx.RoeTTM = dbKs.RoeTTM
+					redisCtx.PBV = dbKs.PBV
+					redisCtx.DividendYield = dbKs.DividendYield
+					redisCtx.RevenueGrowthYoY = dbKs.RevenueGrowthYoY
+					redisCtx.PiotroskiScore = dbKs.PiotroskiScore
+					redisCtx.High52W = dbKs.High52W
+					redisCtx.Low52W = dbKs.Low52W
+					redisCtx.DebtToEquity = dbKs.DebtToEquity
+					redisCtx.KeystatsAvail = true
+					log.Printf("✅ PostgreSQL keystats hit for %s", symbol)
+				} else {
+					log.Printf("ℹ️  PostgreSQL also has no keystats for %s", symbol)
+				}
+			}
 		}
 
 		// 5. Historical Daily Bars (last 5 days)
@@ -256,16 +287,37 @@ func (s *Server) handleSymbolAnalysisStream(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Generate prompt with enriched data (handles empty alerts gracefully)
+	// Task 5.3 & 5.4 — AI Sterilization: Strict Context Grounding
+	// Tentukan apakah data cukup untuk analisis atau harus return DATA_UNAVAILABLE
+	hasProfileData := redisCtx.Name != "" // Profil emiten harus ada
+	hasWhaleData := len(alerts) > 0       // Minimal ada aktivitas whale
+
 	var prompt string
-	if len(alerts) == 0 {
-		prompt = fmt.Sprintf(
-			"Analisis saham %s. PERHATIAN: Tidak ada aktivitas whale alert terdeteksi dalam periode yang diminta. "+
-				"Jelaskan secara umum profil saham ini dan berikan insight tentang kondisi saat ini berdasarkan pengetahuan Anda. "+
-				"Sampaikan juga bahwa data real-time tidak tersedia saat ini.",
-			symbol,
-		)
-	} else {
+	switch {
+	case !hasProfileData && !hasWhaleData:
+		// Task 5.4: Data kosong — kirim event data_unavailable via SSE, JANGAN biarkan LLM menebak
+		fmt.Fprintf(w,
+			"event: data_unavailable\ndata: {\"symbol\":\"%s\",\"reason\":\"no_profile_no_whale\",\"message\":\"Data profil dan aktivitas whale untuk %s belum tersedia di database. Sistem sedang mengisi data secara otomatis (Full-Market Bootstrap berjalan di background). Silakan coba lagi dalam beberapa menit.\"}\n\n",
+			symbol, symbol)
+		fmt.Fprintf(w, "event: done\ndata: DATA_UNAVAILABLE\n\n")
+		flusher.Flush()
+		return
+
+	case !hasProfileData && hasWhaleData:
+		// Ada whale data tapi tidak ada profil — analisis terbatas tanpa identitas perusahaan
+		prompt = llm.FormatSymbolAnalysisPromptNoProfile(symbol, alerts, baseline, orderFlow, followups, redisCtx)
+
+	case !hasWhaleData:
+		// Ada profil tapi tidak ada whale alert — data real-time belum masuk
+		fmt.Fprintf(w,
+			"event: data_unavailable\ndata: {\"symbol\":\"%s\",\"reason\":\"no_whale_activity\",\"message\":\"Tidak ada aktivitas Whale Alert terdeteksi untuk %s dalam periode yang diminta. Data real-time sedang dikumpulkan via WebSocket. Coba lagi saat market buka atau setelah beberapa menit.\"}\n\n",
+			symbol, symbol)
+		fmt.Fprintf(w, "event: done\ndata: DATA_UNAVAILABLE\n\n")
+		flusher.Flush()
+		return
+
+	default:
+		// Data lengkap — jalankan analisis penuh, semua klaim harus dari data DB
 		prompt = llm.FormatSymbolAnalysisPrompt(symbol, alerts, baseline, orderFlow, followups, redisCtx)
 	}
 

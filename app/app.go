@@ -16,6 +16,7 @@ import (
 	"stockbit-haka-haki/cache"
 	"stockbit-haka-haki/config"
 	"stockbit-haka-haki/database"
+	models "stockbit-haka-haki/database/models_pkg"
 	"stockbit-haka-haki/handlers"
 	"stockbit-haka-haki/integration"
 	"stockbit-haka-haki/llm"
@@ -156,6 +157,12 @@ func (a *App) Start() error {
 
 	// 6.5 Smart Bootstrap: Seed historical data if database is empty
 	a.smartBootstrap = NewSmartBootstrap(a.tradeRepo, a.redis)
+
+	// Inject token provider so bootstrap can call Stockbit API autonomously
+	a.smartBootstrap.SetTokenProvider(func() (string, error) {
+		return a.authManager.GetClient().GetValidToken()
+	})
+
 	if a.smartBootstrap.NeedsBootstrap() {
 		log.Println("🚀 Database is empty — starting Smart Bootstrap...")
 		// Run bootstrap in background so WebSocket can start collecting data in parallel
@@ -168,6 +175,40 @@ func (a *App) Start() error {
 		a.smartBootstrap.isComplete.Store(true)
 		log.Println("✅ Database has existing data — skipping bootstrap")
 	}
+
+	// 6.6 Full-Market Profile Bootstrap: Autonomously seed 958 BEI company profiles
+	// Runs in background — does not block WebSocket or API serving.
+	// Triggers only if company_profiles table has fewer than 100 rows.
+	if a.smartBootstrap.NeedsFullMarketBootstrap() {
+		log.Println("🌐 Company profiles missing — launching Full-Market Bootstrap (958 symbols)...")
+		go a.smartBootstrap.RunFullMarketProfileBootstrap(
+			context.Background(),
+			"screener/kode_saham_958.txt",
+		)
+	} else {
+		log.Println("✅ Company profiles already populated — skipping Full-Market Bootstrap")
+	}
+
+	// 6.7 Historical Tick Sweep: Fetch historical running trades from Stockbit
+	// Builds real order-flow data (BUY/SELL labels) for the past N trading days.
+	// Runs as a background goroutine — system remains fully operational during sweep.
+	// Set HISTORY_DAYS_BACK env var to control lookback (default: 30 days).
+	go func() {
+		daysBack := 30
+		if v := os.Getenv("HISTORY_DAYS_BACK"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				daysBack = n
+			}
+		}
+		// Load symbol universe from file; fallback to blue chips
+		symbols, err := LoadAllSymbolsFromFile("screener/kode_saham_958.txt")
+		if err != nil {
+			log.Printf("⚠️ HistoricalTickSweep: Cannot load symbols file, using blue-chip fallback: %v", err)
+			symbols = fallbackBlueChips()
+		}
+		log.Printf("📜 Historical Tick Sweep will run for %d symbols × %d days in background", len(symbols), daysBack)
+		a.smartBootstrap.RunHistoricalTickSweep(context.Background(), symbols, daysBack)
+	}()
 
 	// 7. Initialize LLM client if enabled
 	var llmClient *llm.Client
@@ -206,8 +247,56 @@ func (a *App) Start() error {
 				}
 			}()
 		}
+
+		// Task 4.3 — Dual-write callbacks: collector → Redis AND PostgreSQL
+		// Company Profile: setiap kali collector berhasil fetch, simpan permanen ke DB
+		a.stockbitCollector.SetCompanyProfileCallback(func(in realtime.CompanyProfileInput) {
+			if a.tradeRepo == nil {
+				return
+			}
+			profile := &models.CompanyProfile{
+				Symbol:    in.Symbol,
+				Name:      in.Name,
+				Sector:    in.Sector,
+				SubSector: in.SubSector,
+				Indexes:   in.Indexes,
+			}
+			if err := a.tradeRepo.UpsertCompanyProfile(profile); err != nil {
+				log.Printf("⚠️ dual-write company_profile %s: %v", in.Symbol, err)
+			}
+		})
+
+		// Keystats: setiap kali collector berhasil fetch, simpan permanen ke DB
+		a.stockbitCollector.SetKeystatsCallback(func(in realtime.KeystatInput) {
+			if a.tradeRepo == nil {
+				return
+			}
+			ks := &models.FundamentalKeystat{
+				Symbol:           in.Symbol,
+				PeTTM:            in.PeTTM,
+				EpsTTM:           in.EpsTTM,
+				RoeTTM:           in.RoeTTM,
+				RoaTTM:           in.RoaTTM,
+				NetProfitMargin:  in.NetProfitMargin,
+				RevenueGrowthYoY: in.RevenueGrowthYoY,
+				NetIncomeGrowth:  in.NetIncomeGrowth,
+				DividendYield:    in.DividendYield,
+				PiotroskiScore:   in.PiotroskiScore,
+				High52W:          in.High52W,
+				Low52W:           in.Low52W,
+				PriceReturnYTD:   in.PriceReturnYTD,
+				DebtToEquity:     in.DebtToEquity,
+				EvEbitda:         in.EvEbitda,
+				PBV:              in.PBV,
+				FetchedAt:        time.Now(),
+			}
+			if err := a.tradeRepo.UpsertFundamentalKeystat(ks); err != nil {
+				log.Printf("⚠️ dual-write keystats %s: %v", in.Symbol, err)
+			}
+		})
+
 		go a.stockbitCollector.Start(ctx)
-		log.Println("📡 Stockbit Collector started (running trade + company info → Redis)")
+		log.Println("📡 Stockbit Collector started (running trade + company info → Redis+DB)")
 	}
 
 	// 9. Start Phase 1 Enhancement Trackers

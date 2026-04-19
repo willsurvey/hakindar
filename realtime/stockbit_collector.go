@@ -28,6 +28,36 @@ type StockbitTokenProvider interface {
 	GetValidToken() (string, error)
 }
 
+// CompanyProfileInput is a DTO passed to the dual-write callback (Task 4.3).
+// Defined here to avoid circular imports with database/models_pkg.
+type CompanyProfileInput struct {
+	Symbol    string
+	Name      string
+	Sector    string
+	SubSector string
+	Indexes   string // JSON string, e.g. ["LQ45","IDX30"]
+}
+
+// KeystatInput is a DTO passed to the dual-write callback for fundamental data (Task 4.3).
+type KeystatInput struct {
+	Symbol           string
+	PeTTM            *float64
+	EpsTTM           *float64
+	RoeTTM           *float64
+	RoaTTM           *float64
+	NetProfitMargin  *float64
+	RevenueGrowthYoY *float64
+	NetIncomeGrowth  *float64
+	DividendYield    *float64
+	PiotroskiScore   *float64
+	High52W          *float64
+	Low52W           *float64
+	PriceReturnYTD   *float64
+	DebtToEquity     *float64
+	EvEbitda         *float64
+	PBV              *float64
+}
+
 // RunningTradeSummaryItem aggregates buy/sell per symbol
 type RunningTradeSummaryItem struct {
 	Symbol        string `json:"symbol"`
@@ -148,6 +178,11 @@ type StockbitCollector struct {
 	client    *http.Client
 	baseURL   string
 
+	// Dual-write callbacks: Redis → write to PostgreSQL too (Task 4.3)
+	// Using func type avoids circular import with database package
+	onCompanyProfile func(CompanyProfileInput)  // called after each successful company_info fetch
+	onKeystats       func(KeystatInput)         // called after each successful keystats fetch
+
 	// Symbols to collect company info for (set by watchlist sync)
 	mu      sync.RWMutex
 	symbols []string
@@ -165,6 +200,18 @@ func NewStockbitCollector(auth StockbitTokenProvider, redis StockbitRedis) *Stoc
 	}
 }
 
+// SetDBWriter injects dual-write callbacks for Company Profile and Keystats.
+// app.go calls this with lambdas that call repo.UpsertCompanyProfile / repo.UpsertFundamentalKeystat.
+// This avoids a circular import between realtime and database packages.
+func (c *StockbitCollector) SetCompanyProfileCallback(fn func(CompanyProfileInput)) {
+	c.onCompanyProfile = fn
+}
+
+func (c *StockbitCollector) SetKeystatsCallback(fn func(KeystatInput)) {
+	c.onKeystats = fn
+}
+
+
 // SetSymbols updates the list of symbols to fetch company info for.
 // Thread-safe — can be called from watchlist sync goroutine.
 func (c *StockbitCollector) SetSymbols(symbols []string) {
@@ -178,19 +225,32 @@ func (c *StockbitCollector) SetSymbols(symbols []string) {
 func (c *StockbitCollector) Start(ctx context.Context) {
 	log.Println("📡 StockbitCollector: started")
 
+	// ── HIGH-FREQUENCY (Real-time data — changes every second) ─────────────────
 	// Running trade: fetch every 3 minutes
 	go c.runLoop(ctx, "running_trade", 3*time.Minute, c.fetchAndStoreRunningTrade)
 
-	// Company info: fetch every 10 minutes (only for watchlist symbols)
-	go c.runLoop(ctx, "company_info", 10*time.Minute, c.fetchAndStoreCompanyInfoBatch)
-
-	// Phase 1 — New fetchers
-	go c.runLoop(ctx, "market_mover", 5*time.Minute, c.fetchAndStoreMarketMover)
-	go c.runLoop(ctx, "hist_summary", 5*time.Minute, c.fetchAndStoreHistoricalBatch)
-	go c.runLoop(ctx, "broker_signal", 5*time.Minute, c.fetchAndStoreBrokerSignalBatch)
+	// Orderbook: fetch every 3 minutes (bid/ask walls change rapidly)
 	go c.runLoop(ctx, "orderbook", 3*time.Minute, c.fetchAndStoreOrderbookBatch)
-	go c.runLoop(ctx, "keystats", 10*time.Minute, c.fetchAndStoreKeystatsBatch)
-	go c.runLoop(ctx, "screener_tmpl", 10*time.Minute, c.fetchAndStoreScreenerTemplates)
+
+	// Broker Signal (Bandar Detector): fetch every 5 minutes
+	go c.runLoop(ctx, "broker_signal", 5*time.Minute, c.fetchAndStoreBrokerSignalBatch)
+
+	// Market Mover: fetch every 5 minutes (universe harian)
+	go c.runLoop(ctx, "market_mover", 5*time.Minute, c.fetchAndStoreMarketMover)
+
+	// ── LOW-FREQUENCY (Semi-static data — changes daily or quarterly) ──────────
+	// Historical Summary: fetch every 30 minutes (daily OHLCV — bar baru tiap hari)
+	go c.runLoop(ctx, "hist_summary", 30*time.Minute, c.fetchAndStoreHistoricalBatch)
+
+	// Company Info: fetch every 24 hours (nama, sektor — hampir tidak pernah berubah)
+	// First run tetap immediate, lalu refresh harian untuk update harga/pct
+	go c.runLoop(ctx, "company_info", 24*time.Hour, c.fetchAndStoreCompanyInfoBatch)
+
+	// Keystats (Fundamental): fetch every 24 hours (PE, PBV — rilis per kuartal)
+	go c.runLoop(ctx, "keystats", 24*time.Hour, c.fetchAndStoreKeystatsBatch)
+
+	// Screener templates: fetch every 24 hours (jarang berubah)
+	go c.runLoop(ctx, "screener_tmpl", 24*time.Hour, c.fetchAndStoreScreenerTemplates)
 
 	<-ctx.Done()
 	log.Println("📡 StockbitCollector: stopped")
@@ -436,8 +496,25 @@ func (c *StockbitCollector) fetchAndStoreCompanyInfo(ctx context.Context, symbol
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	}
 
+	// Task 4.3 — Dual-write: callback ke PostgreSQL (permanen) jika tersedia
+	if c.onCompanyProfile != nil {
+		idxBytes, _ := json.Marshal(resp.Data.Indexes)
+		idxStr := string(idxBytes)
+		if idxStr == "null" {
+			idxStr = "[]"
+		}
+		c.onCompanyProfile(CompanyProfileInput{
+			Symbol:    symbol,
+			Name:      resp.Data.Name,
+			Sector:    resp.Data.Sector,
+			SubSector: resp.Data.SubSector,
+			Indexes:   idxStr,
+		})
+	}
+
+	// Task 4.2 — TTL diperpanjang: 12h → 25h (lebih lama dari interval 24h)
 	key := fmt.Sprintf("stockbit:company_info:%s", symbol)
-	return c.redis.Set(ctx, key, info, 12*time.Hour)
+	return c.redis.Set(ctx, key, info, 25*time.Hour)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -648,8 +725,9 @@ func (c *StockbitCollector) fetchAndStoreHistorical(ctx context.Context, symbol,
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	}
 
+	// Task 4.2 — TTL diperpanjang: hist_summary 6h → 12h
 	key := fmt.Sprintf("stockbit:hist:%s", symbol)
-	return c.redis.Set(ctx, key, summary, 6*time.Hour)
+	return c.redis.Set(ctx, key, summary, 12*time.Hour)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -724,8 +802,9 @@ func (c *StockbitCollector) fetchAndStoreBrokerSignal(ctx context.Context, symbo
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	}
 
+	// Task 4.2 — TTL diperpanjang: broker_signal 6h → 8h
 	key := fmt.Sprintf("stockbit:broker:%s", symbol)
-	return c.redis.Set(ctx, key, signal, 6*time.Hour)
+	return c.redis.Set(ctx, key, signal, 8*time.Hour)
 }
 
 // extractAccdist navigates multiple possible paths in the Stockbit marketdetectors response
@@ -951,8 +1030,32 @@ func (c *StockbitCollector) fetchAndStoreKeystats(ctx context.Context, symbol, t
 		UpdatedAt:        time.Now().Format(time.RFC3339),
 	}
 
+	// Task 4.3 — Dual-write: callback ke PostgreSQL (permanen) jika tersedia
+	// Dipanggil dalam goroutine agar tidak memblokir Redis write
+	if c.onKeystats != nil {
+		go c.onKeystats(KeystatInput{
+			Symbol:           symbol,
+			PeTTM:            parsed["pe_ttm"],
+			EpsTTM:           parsed["eps_ttm"],
+			RoeTTM:           parsed["roe_ttm"],
+			RoaTTM:           parsed["roa_ttm"],
+			NetProfitMargin:  parsed["net_profit_margin"],
+			RevenueGrowthYoY: parsed["revenue_growth_yoy"],
+			NetIncomeGrowth:  parsed["net_income_growth_yoy"],
+			DividendYield:    parsed["dividend_yield"],
+			PiotroskiScore:   parsed["piotroski_score"],
+			High52W:          parsed["high_52w"],
+			Low52W:           parsed["low_52w"],
+			PriceReturnYTD:   parsed["price_return_ytd"],
+			DebtToEquity:     parsed["debt_to_equity"],
+			EvEbitda:         parsed["ev_ebitda"],
+			PBV:              parsed["pbv"],
+		})
+	}
+
+	// Task 4.2 — TTL diperpanjang: keystats 12h → 25h (lebih lama dari interval 24h)
 	key := fmt.Sprintf("stockbit:keystats:%s", symbol)
-	return c.redis.Set(ctx, key, ks, 12*time.Hour)
+	return c.redis.Set(ctx, key, ks, 25*time.Hour)
 }
 
 // parseKeystatsValue cleans Stockbit value strings: "12.5%" → 12.5, "(3.2)" → -3.2, "-" → nil

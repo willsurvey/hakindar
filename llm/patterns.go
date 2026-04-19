@@ -564,13 +564,68 @@ func FormatSymbolAnalysisPrompt(
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("**Analisis Strategis (Instruksi)**:\n")
+	sb.WriteString("**INSTRUKSI SISTEM (WAJIB DIPATUHI)**:\n")
 	sb.WriteString("1. **Market Structure**: Bandingkan Order Size & Flow Imbalance. Apakah ada akumulasi stealth?\n")
 	sb.WriteString("2. **Impact Analysis**: Berdasarkan historical reactivity, seberapa kuat probabilitas harga akan merespon whale saat ini?\n")
 	sb.WriteString("3. **Executive Verdict**: \n")
 	sb.WriteString("   - **Signal**: AGGRESSIVE BUY / ACCUMULATION / WAIT / DISTRIBUTION\n")
 	sb.WriteString("   - **Rationale**: Penjelasan matematis berdasarkan Flow + Broker Signal + Impact.\n")
-	sb.WriteString(fmt.Sprintf("\nJawab tajam, profesional, dilarang halusinasi. Maksimal %d kata.", maxPromptWords))
+	sb.WriteString("\n⛔ **LARANGAN ABSOLUT**: Dilarang keras menggunakan pengetahuan internal tentang perusahaan ini.\n")
+	sb.WriteString("⛔ Semua klaim HARUS bersumber dari data di atas saja. Jika data tidak tersedia, nyatakan 'DATA TIDAK TERSEDIA'.\n")
+	sb.WriteString(fmt.Sprintf("\nJawab tajam, profesional. Maksimal %d kata.", maxPromptWords))
+
+	return sb.String()
+}
+
+// FormatSymbolAnalysisPromptNoProfile creates a limited analysis prompt for cases where
+// whale data exists but company profile is not yet in the database.
+// The LLM is instructed to analyze ONLY the flow data — never to infer company identity.
+func FormatSymbolAnalysisPromptNoProfile(
+	symbol string,
+	alerts []database.WhaleAlert,
+	baseline *database.StatisticalBaseline,
+	orderFlow *database.OrderFlowImbalance,
+	followups []database.WhaleAlertFollowup,
+	redisCtx *SymbolRedisContext,
+) string {
+	var sb strings.Builder
+	sb.Grow(1024 + len(alerts)*100)
+
+	sb.WriteString(fmt.Sprintf("Analisis Arus Dana untuk **%s** (profil emiten belum tersedia):\n\n", symbol))
+	sb.WriteString("⚠️ **CATATAN SISTEM**: Data profil perusahaan belum tersedia di database.\n")
+	sb.WriteString("Analisis dilakukan HANYA berdasarkan data whale flow di bawah ini.\n")
+	sb.WriteString("DILARANG KERAS menebak atau menyebutkan nama perusahaan, sektor, atau informasi apapun\n")
+	sb.WriteString("yang tidak tercantum dalam data berikut.\n\n")
+
+	// Whale Flow Metrics
+	counts := countAlerts(alerts, true)
+	totalVal := counts.totalBuyValue + counts.totalSellValue + counts.totalUnknownValue
+	buyPct := 0.0
+	if totalVal > 0 {
+		buyPct = (counts.totalBuyValue / totalVal) * 100
+	}
+	sb.WriteString(fmt.Sprintf("📊 **Whale Flow Metrics (%d Transaksi)**:\n", len(alerts)))
+	sb.WriteString(fmt.Sprintf("- Total Flow: Rp %.1f Miliar\n", totalVal/billionDivisor))
+	sb.WriteString(fmt.Sprintf("- 🐂 Buyer: Rp %.1f M (%.1f%%)\n", counts.totalBuyValue/millionDivisor, buyPct))
+	sb.WriteString(fmt.Sprintf("- 🐻 Seller: Rp %.1f M (%.1f%%)\n", counts.totalSellValue/millionDivisor, 100-buyPct))
+
+	if baseline != nil {
+		sb.WriteString(fmt.Sprintf("\n📈 Baseline: Mean Price %.0f | StdDev Vol %.1f Lots\n", baseline.MeanPrice, baseline.StdDevVolume))
+	}
+	if orderFlow != nil {
+		sb.WriteString(fmt.Sprintf("📊 Order Flow Imbalance: %.1f%%\n", orderFlow.ValueImbalanceRatio*100))
+	}
+
+	sb.WriteString("\n**Instruksi Analisis**:\n")
+	sb.WriteString("1. Klasifikasikan pola flow: Akumulasi / Distribusi / Konsolidasi\n")
+	sb.WriteString("2. Berikan verdict singkat berdasarkan flow data di atas\n")
+	sb.WriteString("3. DILARANG menambahkan konteks perusahaan yang tidak ada dalam data\n")
+	sb.WriteString("\n⛔ Semua klaim HARUS bersumber dari angka di atas. Tidak ada pengecualian.\n")
+	sb.WriteString(fmt.Sprintf("Maksimal %d kata.", maxPromptWords))
+
+	// Suppress unused var warning
+	_ = followups
+	_ = redisCtx
 
 	return sb.String()
 }
