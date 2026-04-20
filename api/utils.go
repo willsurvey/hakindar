@@ -6,13 +6,8 @@ import (
 	"strconv"
 )
 
-// Market hours constants
-const (
-	marketOpenHour  = 9  // 09:00 WIB - market open
-	marketCloseHour = 16 // 16:00 WIB - market close
-	marketTimeZone  = "Asia/Jakarta"
-	millionDivisor  = 1_000_000
-)
+// millionDivisor converts a raw Rupiah value to millions for display
+const millionDivisor = 1_000_000
 
 // setupSSE configures the response writer for Server-Sent Events streaming
 // Returns the Flusher if supported, or an error if not

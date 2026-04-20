@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -169,10 +168,9 @@ func (h *RunningTradeHandler) Close() {
 	})
 }
 
-// Handle adalah method legacy - tidak digunakan dengan implementasi protobuf baru
-func (h *RunningTradeHandler) Handle(data []byte) error {
-	return fmt.Errorf("use HandleProto instead")
-}
+// Handle satisfies the MessageHandler interface.
+// RunningTradeHandler uses protobuf exclusively — use HandleProto instead.
+func (h *RunningTradeHandler) Handle(_ []byte) error { return nil }
 
 // HandleProto memproses pesan protobuf wrapper dari WebSocket
 func (h *RunningTradeHandler) HandleProto(wrapper interface{}) error {
