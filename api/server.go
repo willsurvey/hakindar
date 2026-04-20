@@ -2,6 +2,7 @@ package api
 
 import (
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,10 +13,10 @@ import (
 
 	"stockbit-haka-haki/cache"
 	"stockbit-haka-haki/database"
+	"stockbit-haka-haki/helpers"
 	"stockbit-haka-haki/llm"
 	"stockbit-haka-haki/notifications"
 	"stockbit-haka-haki/realtime"
-	"stockbit-haka-haki/helpers"
 )
 
 // Server handles HTTP API requests
@@ -144,8 +145,10 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 // handleMarketStatus returns whether the IDX market is open or closed
 func (s *Server) handleMarketStatus(w http.ResponseWriter, r *http.Request) {
 	isOpen := helpers.IsMarketOpen()
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"is_open": isOpen,
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"is_open":       isOpen,
+		"market_status": helpers.GetMarketStatus(time.Now()),
 	})
 }
 
