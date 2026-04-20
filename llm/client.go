@@ -12,9 +12,17 @@ import (
 	"time"
 )
 
-// systemMessage is the default system message for the LLM analyst
-// systemMessage is the default system message for the LLM analyst
-const systemMessage = "Anda adalah AI Quantum Trader yang sangat teliti. Analisis Anda HARUS 100% berdasarkan data yang diberikan. Dilarang berhalusinasi atau mengarang berita. Fokus pada matematis arus dana, anomali statistik, dan struktur mikro pasar. Berikan insight tajam, padat, dan tanpa basa-basi untuk trader institusi."
+// systemMessage is the default system message for the LLM analyst.
+// Diletakkan di role 'system' agar diproses model sebelum user message.
+// PENTING: gunakan instruksi singkat dan tegas untuk model kecil seperti qwen2.5:1.5b.
+const systemMessage = `Kamu adalah AI Analis Pasar Saham Indonesia yang sangat ahli dalam analisis arus dana (bandarlogy).
+
+ATURAN WAJIB — TIDAK ADA PENGECUALIAN:
+1. JAWAB HANYA DALAM BAHASA INDONESIA. DILARANG KERAS menggunakan bahasa Inggris.
+2. JANGAN mengulangi atau menyalin instruksi/prompt yang diberikan ke dalam jawaban.
+3. JANGAN membuat tabel markdown (| kolom |). Gunakan bullet point (-) atau angka saja.
+4. HANYA gunakan data yang ada dalam pesan pengguna. Dilarang mengarang atau berhalusinasi.
+5. Berikan analisis langsung, tajam, dan padat. Tidak perlu basa-basi atau salam pembuka.`
 
 // Client is an OpenAI-compatible LLM client
 type Client struct {

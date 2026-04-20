@@ -15,7 +15,7 @@ const (
 	billionDivisor = 1_000_000_000
 	millionDivisor = 1_000_000
 	maxAnomalies   = 10
-	maxPromptWords = 200
+	maxPromptWords = 400 // Dinaikkan dari 200 agar analisis tidak terpotong
 )
 
 // SymbolRedisContext holds enriched real-time data from Redis for a specific symbol.
@@ -326,6 +326,8 @@ func FormatSymbolAnalysisPrompt(
 	var sb strings.Builder
 	sb.Grow(2048 + len(alerts)*100)
 
+	// Lapisan kedua instruksi bahasa — diperlukan untuk model kecil yang butuh reinforcement
+	sb.WriteString("[BAHASA: INDONESIA] [FORMAT: BULLET POINT, DILARANG TABEL MARKDOWN]\n\n")
 	sb.WriteString(fmt.Sprintf("Lakukan Deep Dive Analisis Arus Dana untuk **%s**:\n\n", symbol))
 
 	// 0. Redis Enrichment — Real-time context (Fase 1)
@@ -564,15 +566,13 @@ func FormatSymbolAnalysisPrompt(
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("**INSTRUKSI SISTEM (WAJIB DIPATUHI)**:\n")
-	sb.WriteString("1. **Market Structure**: Bandingkan Order Size & Flow Imbalance. Apakah ada akumulasi stealth?\n")
-	sb.WriteString("2. **Impact Analysis**: Berdasarkan historical reactivity, seberapa kuat probabilitas harga akan merespon whale saat ini?\n")
-	sb.WriteString("3. **Executive Verdict**: \n")
-	sb.WriteString("   - **Signal**: AGGRESSIVE BUY / ACCUMULATION / WAIT / DISTRIBUTION\n")
-	sb.WriteString("   - **Rationale**: Penjelasan matematis berdasarkan Flow + Broker Signal + Impact.\n")
-	sb.WriteString("\n⛔ **LARANGAN ABSOLUT**: Dilarang keras menggunakan pengetahuan internal tentang perusahaan ini.\n")
-	sb.WriteString("⛔ Semua klaim HARUS bersumber dari data di atas saja. Jika data tidak tersedia, nyatakan 'DATA TIDAK TERSEDIA'.\n")
-	sb.WriteString(fmt.Sprintf("\nJawab tajam, profesional. Maksimal %d kata.", maxPromptWords))
+	sb.WriteString("\n---\n")
+	sb.WriteString("**OUTPUT YANG DIHARAPKAN** (ikuti format ini persis, dalam Bahasa Indonesia):\n\n")
+	sb.WriteString("**Market Structure**: [analisis akumulasi/distribusi berdasarkan order size dan flow imbalance]\n")
+	sb.WriteString("**Impact Analysis**: [probabilitas harga merespon, berdasarkan historical reactivity di atas]\n")
+	sb.WriteString("**Signal**: AGGRESSIVE BUY / ACCUMULATION / WAIT / DISTRIBUTION\n")
+	sb.WriteString("**Rationale**: [penjelasan singkat berbasis angka di atas saja]\n")
+	sb.WriteString(fmt.Sprintf("\n⛔ Dilarang: bahasa Inggris, tabel markdown, pengulangan prompt, data di luar konteks di atas.\nMaksimal %d kata.", maxPromptWords))
 
 	return sb.String()
 }
