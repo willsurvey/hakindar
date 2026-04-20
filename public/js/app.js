@@ -116,14 +116,13 @@ async function init() {
                     const distTbody = safeGetElement('distribution-table-body');
                     if (distTbody) distTbody.innerHTML = '<tr><td colspan="4" class="text-center p-8 text-accentDanger"><span class="text-2xl block mb-2">⚠️</span>Gagal memuat data Distribusi.</td></tr>';
                 }),
-            fetchMarketStatus()
-        ]);
             API.fetchRunningPositions()
                 .then(renderPositions)
                 .catch(err => {
                     console.error('Initial positions fetch failed:', err);
-                    renderPositions(null); // Passing null triggers error UI in renderPositions
-                })
+                    renderPositions(null);
+                }),
+            fetchMarketStatus()
         ]);
     } catch (error) {
         console.error('Initial data load error:', error);
@@ -132,7 +131,6 @@ async function init() {
     // Setup event listeners
     setupFilterControls();
     setupModals();
-    setupAnalyticsTabs();
     setupAnalyticsTabs();
     setupInfiniteScroll();
     setupProfitLossHistory();
@@ -172,7 +170,12 @@ async function init() {
 }
 
 /**
- * Fetch market status
+ * Fetch market status and update UI accordingly.
+ * - Shows/hides the live-alerts-section (only visible when market is open)
+ * - Updates the navbar Live indicator
+ * NOTE: Do NOT modify bandar-timeframe here. That label is already managed
+ * by renderAccumulationSummary() which receives market_status from the backend.
+ * Adding status text here would cause a duplicate like "(CLOSED) (CLOSED)".
  */
 async function fetchMarketStatus() {
     try {
@@ -180,21 +183,22 @@ async function fetchMarketStatus() {
         const data = await response.json();
         state.marketIsOpen = data.is_open;
         
+        // Show live alerts section only when market is open
         const liveAlertsSection = document.getElementById('live-alerts-section');
         if (liveAlertsSection) {
-            if (state.marketIsOpen) {
-                liveAlertsSection.style.display = 'block';
-            } else {
-                liveAlertsSection.style.display = 'none';
-            }
+            liveAlertsSection.style.display = state.marketIsOpen ? 'block' : 'none';
         }
 
-        // Update bandar timeframe text with market status
-        const timeEl = document.getElementById('bandar-timeframe');
-        if (timeEl && !timeEl.textContent.includes('Gagal')) {
-            const statusText = state.marketIsOpen ? '(OPEN)' : '(CLOSED)';
-            if (!timeEl.textContent.includes('(CLOSED)') && !timeEl.textContent.includes('(OPEN)')) {
-                timeEl.textContent = `${timeEl.textContent} ${statusText}`;
+        // Update the navbar Live/Closed indicator
+        const navLiveDot = document.getElementById('nav-live-dot');
+        const navLiveLabel = document.getElementById('nav-live-label');
+        if (navLiveDot && navLiveLabel) {
+            if (state.marketIsOpen) {
+                navLiveDot.className = 'w-1.5 h-1.5 bg-accentSuccess rounded-full animate-pulse';
+                navLiveLabel.textContent = 'Live';
+            } else {
+                navLiveDot.className = 'w-1.5 h-1.5 bg-textMuted rounded-full';
+                navLiveLabel.textContent = 'Market Closed';
             }
         }
     } catch (error) {
@@ -211,9 +215,10 @@ async function fetchAlerts(reset = false) {
     if (!reset && !state.hasMore) return;
 
     state.isLoading = true;
-    const loadingDiv = safeGetElement('loading');
-    const loadingMore = safeGetElement('loading-more');
-    const noMoreData = safeGetElement('no-more-data');
+    // Use loading indicators inside the history alerts section (NOT the live alerts section)
+    const loadingDiv = safeGetElement('history-alerts-loading');
+    const loadingMore = safeGetElement('history-alerts-loading-more');
+    const noMoreData = safeGetElement('history-alerts-no-more');
 
     console.log(`🔍 Fetching alerts... Reset: ${reset}, Offset: ${state.currentOffset}, HasMore: ${state.hasMore}`);
 
@@ -706,7 +711,7 @@ function setupInfiniteScroll() {
         fetchFunction: () => fetchAlerts(false),
         getHasMore: () => state.hasMore,
         getIsLoading: () => state.isLoading,
-        noMoreDataId: 'no-more-data'
+        noMoreDataId: 'history-alerts-no-more'
     });
 }
 

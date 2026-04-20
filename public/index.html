@@ -174,10 +174,11 @@
                         class="p-2 rounded-lg border border-borderColor hover:bg-bgHover transition-colors text-lg"
                         title="Help">❓</button>
                     <div
-                        class="flex items-center gap-2 px-3 py-1.5 bg-accentSuccess/10 border border-accentSuccess/20 rounded-lg text-accentSuccess text-sm font-semibold">
-                        <span class="w-1.5 h-1.5 bg-accentSuccess rounded-full animate-pulse"></span>
-                        <span>Live</span>
-                    </div>
+                    class="flex items-center gap-2 px-3 py-1.5 bg-accentSuccess/10 border border-accentSuccess/20 rounded-lg text-accentSuccess text-sm font-semibold"
+                    id="nav-market-status">
+                    <span class="w-1.5 h-1.5 bg-accentSuccess rounded-full animate-pulse" id="nav-live-dot"></span>
+                    <span id="nav-live-label">Live</span>
+                </div>
                 </div>
             </div>
         </div>
@@ -398,6 +399,22 @@
                                 <!-- Rows injected here -->
                             </tbody>
                         </table>
+                    </div>
+                    <!-- Loading indicator for initial fetch -->
+                    <div id="history-alerts-loading" class="p-8 text-center text-textSecondary bg-bgCard border-t border-borderColor">
+                        <div class="animate-spin h-8 w-8 border-4 border-borderColor border-t-accentInfo rounded-full mx-auto mb-4"></div>
+                        <p>Memuat riwayat alert...</p>
+                    </div>
+                    <!-- Loading more indicator -->
+                    <div id="history-alerts-loading-more"
+                        class="p-4 text-center text-textSecondary text-sm border-t border-borderColor hidden bg-bgCard">
+                        <div class="inline-block animate-spin h-4 w-4 border-2 border-borderColor border-t-accentInfo rounded-full mr-2"></div>
+                        <span>Memuat lebih banyak...</span>
+                    </div>
+                    <!-- No more data indicator -->
+                    <div id="history-alerts-no-more"
+                        class="p-4 text-center text-textMuted text-sm italic border-t border-borderColor hidden bg-bgCard">
+                        <p>📊 Semua riwayat alert sudah dimuat</p>
                     </div>
                 </div>
             </section>
