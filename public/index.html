@@ -308,12 +308,12 @@
                 </div>
             </section>
 
-            <!-- Whale Alerts Table -->
-            <section class="card-base lg:col-span-2">
+            <!-- Whale Alerts Table (Live Only) -->
+            <section class="card-base lg:col-span-2" id="live-alerts-section">
                 <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-3 gap-2">
                     <div>
-                        <h2 class="text-sm font-bold mb-0.5">🐋 Alert Bandar</h2>
-                        <p class="text-[10px] text-textSecondary">Real-time whale transactions</p>
+                        <h2 class="text-sm font-bold mb-0.5" id="live-alerts-title">🐋 Alert Bandar</h2>
+                        <p class="text-[10px] text-textSecondary" id="live-alerts-subtitle">Real-time whale transactions</p>
                     </div>
                 </div>
 
@@ -367,6 +367,37 @@
                     <div id="no-more-data"
                         class="p-4 text-center text-textMuted text-sm italic border-t border-borderColor hidden bg-bgCard">
                         <p>📊 All data loaded</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Riwayat Alert Bandar (History) -->
+            <section class="card-base lg:col-span-2">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-3 gap-2">
+                    <div>
+                        <h2 class="text-sm font-bold mb-0.5">🕰️ Riwayat Alert Bandar</h2>
+                        <p class="text-[10px] text-textSecondary">Completed whale alerts</p>
+                    </div>
+                </div>
+
+                <div class="border border-borderColor rounded-lg overflow-hidden flex flex-col h-[500px]">
+                    <div class="overflow-auto flex-1 table-wrapper">
+                        <table class="w-full text-left border-collapse min-w-[800px]" id="history-alerts-table">
+                            <thead class="bg-bgSecondary sticky top-0 left-0 right-0 z-10 w-full table-header-group">
+                                <tr>
+                                    <th class="px-2 py-1.5 text-[10px] font-bold uppercase text-textMuted text-left w-[10%]">Time</th>
+                                    <th class="px-2 py-1.5 text-[10px] font-bold uppercase text-textMuted text-left w-[15%]">Stock</th>
+                                    <th class="px-2 py-1.5 text-[10px] font-bold uppercase text-textMuted text-center w-[8%]">Act</th>
+                                    <th class="px-2 py-1.5 text-[10px] font-bold uppercase text-textMuted text-right w-[12%]">Price</th>
+                                    <th class="px-2 py-1.5 text-[10px] font-bold uppercase text-textMuted text-right w-[13%]">Val</th>
+                                    <th class="px-2 py-1.5 text-[10px] font-bold uppercase text-textMuted text-right w-[10%]">Vol</th>
+                                    <th class="px-2 py-1.5 text-[10px] font-bold uppercase text-textMuted text-left w-[32%]">Info</th>
+                                </tr>
+                            </thead>
+                            <tbody id="history-alerts-table-body" class="divide-y divide-borderColor">
+                                <!-- Rows injected here -->
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </section>

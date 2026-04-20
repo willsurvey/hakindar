@@ -36,6 +36,7 @@ const state = {
         amount: 0,
         board: 'ALL'
     },
+    marketIsOpen: false,
     whaleSSE: null,
     patternSSE: null,
     currentPatternType: 'accumulation',
@@ -115,6 +116,8 @@ async function init() {
                     const distTbody = safeGetElement('distribution-table-body');
                     if (distTbody) distTbody.innerHTML = '<tr><td colspan="4" class="text-center p-8 text-accentDanger"><span class="text-2xl block mb-2">⚠️</span>Gagal memuat data Distribusi.</td></tr>';
                 }),
+            fetchMarketStatus()
+        ]);
             API.fetchRunningPositions()
                 .then(renderPositions)
                 .catch(err => {
@@ -169,7 +172,38 @@ async function init() {
 }
 
 /**
- * Fetch whale alerts
+ * Fetch market status
+ */
+async function fetchMarketStatus() {
+    try {
+        const response = await fetch('/api/market/status');
+        const data = await response.json();
+        state.marketIsOpen = data.is_open;
+        
+        const liveAlertsSection = document.getElementById('live-alerts-section');
+        if (liveAlertsSection) {
+            if (state.marketIsOpen) {
+                liveAlertsSection.style.display = 'block';
+            } else {
+                liveAlertsSection.style.display = 'none';
+            }
+        }
+
+        // Update bandar timeframe text with market status
+        const timeEl = document.getElementById('bandar-timeframe');
+        if (timeEl && !timeEl.textContent.includes('Gagal')) {
+            const statusText = state.marketIsOpen ? '(OPEN)' : '(CLOSED)';
+            if (!timeEl.textContent.includes('(CLOSED)') && !timeEl.textContent.includes('(OPEN)')) {
+                timeEl.textContent = `${timeEl.textContent} ${statusText}`;
+            }
+        }
+    } catch (error) {
+        console.error('Failed to fetch market status:', error);
+    }
+}
+
+/**
+ * Fetch whale alerts (History)
  * @param {boolean} reset - Reset pagination
  */
 async function fetchAlerts(reset = false) {
@@ -192,7 +226,7 @@ async function fetchAlerts(reset = false) {
         if (noMoreData) noMoreData.style.display = 'none';
     }
 
-    const tbody = safeGetElement('alerts-table-body');
+    const tbody = safeGetElement('history-alerts-table-body');
 
     try {
         const offset = reset ? 0 : state.currentOffset;
@@ -201,7 +235,7 @@ async function fetchAlerts(reset = false) {
         const alerts = data.data || [];
         state.hasMore = data.has_more || false;
 
-        console.log(`✅ Received ${alerts.length} alerts. Total: ${state.alerts.length + alerts.length}, HasMore: ${state.hasMore}`);
+        console.log(`✅ Received ${alerts.length} history alerts. Total: ${state.alerts.length + alerts.length}, HasMore: ${state.hasMore}`);
 
         if (reset) {
             state.alerts = alerts;
@@ -668,7 +702,7 @@ function highlightActiveFilters() {
  */
 function setupInfiniteScroll() {
     setupTableInfiniteScroll({
-        tableBodyId: 'alerts-table-body',
+        tableBodyId: 'history-alerts-table-body',
         fetchFunction: () => fetchAlerts(false),
         getHasMore: () => state.hasMore,
         getIsLoading: () => state.isLoading,
@@ -706,16 +740,17 @@ function connectWhaleAlertSSE() {
                 );
             }
 
-            // Prepend new alert
-            state.alerts.unshift(newAlert);
-            if (state.alerts.length > CONFIG.MAX_ALERTS_CACHE) {
-                state.alerts.pop();
+            // For live alerts, we might want to keep a separate array, but let's just render it directly to the live table
+            // Prepend new alert to UI without merging with history completely (or just keep a small array for live)
+            if (!state.liveAlerts) state.liveAlerts = [];
+            state.liveAlerts.unshift(newAlert);
+            if (state.liveAlerts.length > 50) {
+                state.liveAlerts.pop();
             }
-            state.currentOffset = Math.min(state.currentOffset + 1, CONFIG.MAX_ALERTS_CACHE);
 
             const tbody = safeGetElement('alerts-table-body');
-            const loadingDiv = safeGetElement('loading');
-            renderWhaleAlertsTable(state.alerts, tbody, loadingDiv);
+            const loadingDiv = null; // No loading div for live
+            renderWhaleAlertsTable(state.liveAlerts, tbody, loadingDiv, false);
 
             // Refresh stats
             fetchStats();

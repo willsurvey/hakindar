@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"stockbit-haka-haki/helpers"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,6 +275,12 @@ func (c *StockbitCollector) runLoop(ctx context.Context, name string, interval t
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// For high-frequency endpoints, skip if market is closed to save bandwidth/API limits
+			if !helpers.IsMarketOpen() && (name == "running_trade" || name == "orderbook" || name == "broker_signal") {
+				// Cukup diam atau log sekali-sekali (jangan spam)
+				continue
+			}
+
 			if err := fn(ctx); err != nil {
 				log.Printf("⚠️  [%s] collect error: %v", name, err)
 			}

@@ -17,6 +17,7 @@ import (
 	"stockbit-haka-haki/cache"
 	"stockbit-haka-haki/database"
 	models "stockbit-haka-haki/database/models_pkg"
+	"stockbit-haka-haki/helpers"
 )
 
 // SmartBootstrap handles intelligent cold-start data seeding
@@ -1084,6 +1085,19 @@ func (sb *SmartBootstrap) RunHistoricalTickSweep(ctx context.Context, symbols []
 
 		// Loop semua simbol untuk tanggal ini
 		for _, sym := range symbols {
+			// JIKA MARKET BUKA, JEDA/TUNGGU SAMPAI TUTUP
+			// Untuk mencegah Historical Sweep (masa lalu) mengganggu API limit Running Trade (live)
+			for helpers.IsMarketOpen() {
+				log.Println("⏸️ HistoricalTickSweep: Market is OPEN. Pausing historical sweep until market closes...")
+				time.Sleep(5 * time.Minute)
+				
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+			}
+
 			select {
 			case <-ctx.Done():
 				log.Printf("🛑 HistoricalTickSweep: Stopped (shutdown signal) at date=%s symbol=%s", dateStr, sym)

@@ -15,6 +15,7 @@ import (
 	"stockbit-haka-haki/llm"
 	"stockbit-haka-haki/notifications"
 	"stockbit-haka-haki/realtime"
+	"stockbit-haka-haki/helpers"
 )
 
 // Server handles HTTP API requests
@@ -89,6 +90,7 @@ func (s *Server) Start(port int) error {
 	s.registerAnalyticsRoutes(mux)
 
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /api/market/status", s.handleMarketStatus)
 	mux.HandleFunc("GET /api/bootstrap/status", s.handleBootstrapStatus)
 	mux.HandleFunc("GET /api/portfolio", s.handlePortfolioSummary)
 
@@ -136,6 +138,14 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// handleMarketStatus returns whether the IDX market is open or closed
+func (s *Server) handleMarketStatus(w http.ResponseWriter, r *http.Request) {
+	isOpen := helpers.IsMarketOpen()
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"is_open": isOpen,
 	})
 }
 
