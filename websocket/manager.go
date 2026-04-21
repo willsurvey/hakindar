@@ -114,6 +114,14 @@ func (cm *ConnectionManager) ReadMessage() (*pb.WebsocketWrapMessageChannel, err
 	return msg, err
 }
 
+// Close closes the WebSocket connection gracefully.
+func (cm *ConnectionManager) Close() error {
+	if cm.client != nil {
+		return cm.client.Close()
+	}
+	return nil
+}
+
 // safeReconnect prevents concurrent reconnects via mutex.
 // Returns false if a reconnect is already in progress (caller should skip).
 func (cm *ConnectionManager) safeReconnect(caller string) error {
