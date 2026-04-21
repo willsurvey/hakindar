@@ -7,6 +7,7 @@ import (
 	"stockbit-haka-haki/auth"
 	pb "stockbit-haka-haki/proto"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,10 @@ type ConnectionManager struct {
 	authManager *auth.AuthManager
 	wsURL       string
 	lastMsgTime time.Time
+
+	// reconnectMu prevents concurrent reconnections (health monitor + token refresh racing)
+	reconnectMu   sync.Mutex
+	isReconnecting bool
 }
 
 // NewConnectionManager creates a new ConnectionManager.
@@ -109,51 +114,31 @@ func (cm *ConnectionManager) ReadMessage() (*pb.WebsocketWrapMessageChannel, err
 	return msg, err
 }
 
-// Close closes the connection.
-func (cm *ConnectionManager) Close() error {
-	if cm.client != nil {
-		return cm.client.Close()
+// safeReconnect prevents concurrent reconnects via mutex.
+// Returns false if a reconnect is already in progress (caller should skip).
+func (cm *ConnectionManager) safeReconnect(caller string) error {
+	cm.reconnectMu.Lock()
+	if cm.isReconnecting {
+		cm.reconnectMu.Unlock()
+		log.Printf("🔄 [%s] Reconnect skipped — another reconnect already in progress", caller)
+		return nil
 	}
-	return nil
-}
+	cm.isReconnecting = true
+	cm.reconnectMu.Unlock()
 
-// Reconnect attempts to reconnect the WebSocket.
-func (cm *ConnectionManager) Reconnect() error {
-	// Close existing connection
-	_ = cm.Close()
+	defer func() {
+		cm.reconnectMu.Lock()
+		cm.isReconnecting = false
+		cm.reconnectMu.Unlock()
+	}()
 
-	// Ensure token is valid before reconnecting
-	authClient := cm.authManager.GetClient()
-	if !authClient.IsTokenValid() {
-		log.Println("🔑 Token expired, refreshing for reconnection...")
-		if err := authClient.RefreshToken(); err != nil {
-			log.Println("⚠️  Token refresh failed, logging in again...")
-			if err := authClient.Login(); err != nil {
-				return fmt.Errorf("login failed: %w", err)
-			}
-		}
-	}
-
-	// Re-establish connection
-	accessToken := authClient.GetAccessToken()
-	cm.client = NewClient(cm.wsURL, accessToken)
-
-	if err := cm.client.Connect(); err != nil {
-		return fmt.Errorf("websocket connection failed: %w", err)
-	}
-
-	if err := cm.AuthenticateAndSubscribe(); err != nil {
-		return err
-	}
-
-	cm.StartPing(25 * time.Second)
-	log.Println("✅ Reconnection successful with refreshed token")
-	return nil
+	return cm.Reconnect()
 }
 
 // RunHealthMonitor starts a background loop to check connection health.
+// Reconnects if no message received for 90 seconds (reduced from 5 minutes).
 func (cm *ConnectionManager) RunHealthMonitor(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second) // Check every 60 seconds
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
 	defer ticker.Stop()
 
 	log.Println("💓 WebSocket health monitoring started")
@@ -166,11 +151,11 @@ func (cm *ConnectionManager) RunHealthMonitor(ctx context.Context) {
 		case <-ticker.C:
 			timeSinceLastMessage := time.Since(cm.lastMsgTime)
 
-			// If no message received in 5 minutes, consider connection unhealthy
-			if timeSinceLastMessage > 5*time.Minute {
+			// Reconnect if silent for 90 seconds (market sends hundreds of msgs/min)
+			if timeSinceLastMessage > 90*time.Second {
 				log.Printf("⚠️  No WebSocket message received for %v, reconnecting...", timeSinceLastMessage.Round(time.Second))
 
-				if err := cm.Reconnect(); err != nil {
+				if err := cm.safeReconnect("HealthMonitor"); err != nil {
 					log.Printf("❌ WebSocket reconnection failed: %v", err)
 				} else {
 					log.Println("✅ WebSocket reconnected successfully")
@@ -183,18 +168,49 @@ func (cm *ConnectionManager) RunHealthMonitor(ctx context.Context) {
 	}
 }
 
+// Reconnect attempts to reconnect the WebSocket.
+func (cm *ConnectionManager) Reconnect() error {
+	log.Println("🔄 Attempting to reconnect in 5s...")
+	time.Sleep(5 * time.Second)
+
+	if cm.client != nil {
+		_ = cm.client.Close()
+	}
+
+	authClient := cm.authManager.GetClient()
+
+	// Try to refresh token before reconnecting
+	if err := authClient.RefreshToken(); err != nil {
+		log.Printf("⚠️  Token refresh during reconnect failed: %v", err)
+	}
+
+	accessToken := authClient.GetAccessToken()
+	cm.client = NewClient(cm.wsURL, accessToken)
+
+	if err := cm.client.Connect(); err != nil {
+		return fmt.Errorf("websocket connection failed: %w", err)
+	}
+
+	// Re-authenticate and re-subscribe
+	if err := cm.AuthenticateAndSubscribe(); err != nil {
+		return fmt.Errorf("websocket re-subscribe failed: %w", err)
+	}
+
+	// Restart ping on new connection
+	cm.client.StartPing(25 * time.Second)
+	log.Println("✅ Reconnection successful with refreshed token")
+	return nil
+}
+
 // UpdateToken updates the client connection when token is refreshed externally.
+// Uses safeReconnect to avoid racing with health monitor.
 func (cm *ConnectionManager) UpdateToken(newToken string) {
 	log.Println("🔄 Updating WebSocket connection with refreshed token...")
-	_ = cm.Close()
 
-	// Reconnect will pick up the new token from AuthManager (which shares the AuthClient)
-	// But note: NewConnectionManager doesn't reference AuthClient directly, it references AuthManager.
-	// We should rely on AuthManager having the updated token.
-
-	if err := cm.Reconnect(); err != nil {
+	if err := cm.safeReconnect("TokenUpdate"); err != nil {
 		log.Printf("⚠️  Failed to reconnect WebSocket after token update: %v", err)
 	} else {
 		log.Println("✅ WebSocket reconnected with new token")
 	}
 }
+
